@@ -68,8 +68,6 @@ import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 import static com.android.networkstack.util.DnsUtils.PRIVATE_DNS_PROBE_HOST_SUFFIX;
 import static com.android.networkstack.util.DnsUtils.TYPE_ADDRCONFIG;
 
-import android.annotation.NonNull;
-import android.annotation.Nullable;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -115,6 +113,8 @@ import android.util.Log;
 import android.util.Pair;
 
 import androidx.annotation.ArrayRes;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.annotation.StringRes;
 
 import com.android.internal.annotations.VisibleForTesting;
@@ -368,7 +368,13 @@ public class NetworkMonitor extends StateMachine {
         } catch (RemoteException e) {
             version = 0;
         }
-        if (version == Build.VERSION_CODES.CUR_DEVELOPMENT) version = 0;
+        // The AIDL was freezed from Q beta 5 but it's unfreezing from R before releasing. In order
+        // to distinguish the behavior between R and Q beta 5 and before Q beta 5, add SDK and
+        // CODENAME check here. Basically, it's only expected to return 0 for Q beta 4 and below
+        // because the test result has changed.
+        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q
+                && Build.VERSION.CODENAME.equals("REL")
+                && version == Build.VERSION_CODES.CUR_DEVELOPMENT) version = 0;
         return version;
     }
 
@@ -555,6 +561,14 @@ public class NetworkMonitor extends StateMachine {
         }
     }
 
+    private void notifyProbeStatusChanged(int probesCompleted, int probesSucceeded) {
+        try {
+            mCallback.notifyProbeStatusChanged(probesCompleted, probesSucceeded);
+        } catch (RemoteException e) {
+            Log.e(TAG, "Error sending probe status", e);
+        }
+    }
+
     private void showProvisioningNotification(String action) {
         try {
             mCallback.showProvisioningNotification(action, mContext.getPackageName());
@@ -667,6 +681,8 @@ public class NetworkMonitor extends StateMachine {
                     //         no resolved IP addresses, IPs unreachable,
                     //         port 853 unreachable, port 853 is not running a
                     //         DNS-over-TLS server, et cetera).
+                    // Cancel any outstanding CMD_EVALUATE_PRIVATE_DNS.
+                    removeMessages(CMD_EVALUATE_PRIVATE_DNS);
                     sendMessage(CMD_EVALUATE_PRIVATE_DNS);
                     break;
                 }
@@ -1020,11 +1036,19 @@ public class NetworkMonitor extends StateMachine {
                             handlePrivateDnsEvaluationFailure();
                             break;
                         }
+                        handlePrivateDnsEvaluationSuccess();
+                    } else {
+                        mEvaluationState.removeProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS);
                     }
 
                     // All good!
                     transitionTo(mValidatedState);
                     break;
+                case CMD_PRIVATE_DNS_SETTINGS_CHANGED:
+                    // When settings change the reevaluation timer must be reset.
+                    mPrivateDnsReevalDelayMs = INITIAL_REEVALUATE_DELAY_MS;
+                    // Let the message bubble up and be handled by parent states as usual.
+                    return NOT_HANDLED;
                 default:
                     return NOT_HANDLED;
             }
@@ -1051,8 +1075,6 @@ public class NetworkMonitor extends StateMachine {
             } catch (UnknownHostException uhe) {
                 mPrivateDnsConfig = null;
             }
-            mEvaluationState.noteProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS,
-                    (mPrivateDnsConfig != null) /* succeeded */);
         }
 
         private void notifyPrivateDnsConfigResolved() {
@@ -1063,7 +1085,14 @@ public class NetworkMonitor extends StateMachine {
             }
         }
 
+        private void handlePrivateDnsEvaluationSuccess() {
+            mEvaluationState.noteProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS,
+                    true /* succeeded */);
+        }
+
         private void handlePrivateDnsEvaluationFailure() {
+            mEvaluationState.noteProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS,
+                    false /* succeeded */);
             mEvaluationState.reportEvaluationResult(NETWORK_VALIDATION_RESULT_INVALID,
                     null /* redirectUrl */);
             // Queue up a re-evaluation with backoff.
@@ -1072,10 +1101,6 @@ public class NetworkMonitor extends StateMachine {
             // transitioning back to EvaluatingState, to perhaps give ourselves
             // the opportunity to (re)detect a captive portal or something.
             //
-            // TODO: distinguish between CMD_EVALUATE_PRIVATE_DNS messages that are caused by server
-            // lookup failures (which should continue to do exponential backoff) and
-            // CMD_EVALUATE_PRIVATE_DNS messages that are caused by user reconfiguration (which
-            // should be processed immediately.
             sendMessageDelayed(CMD_EVALUATE_PRIVATE_DNS, mPrivateDnsReevalDelayMs);
             mPrivateDnsReevalDelayMs *= 2;
             if (mPrivateDnsReevalDelayMs > MAX_REEVALUATE_DELAY_MS) {
@@ -1101,7 +1126,6 @@ public class NetworkMonitor extends StateMachine {
                         String.format("%dms - Error: %s", time, uhe.getMessage()));
             }
             logValidationProbe(time, PROBE_PRIVDNS, success ? DNS_SUCCESS : DNS_FAILURE);
-            mEvaluationState.noteProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS, success);
             return success;
         }
     }
@@ -2105,20 +2129,41 @@ public class NetworkMonitor extends StateMachine {
         // Indicates which probes have completed since clearProbeResults was called.
         // This is a bitmask of INetworkMonitor.NETWORK_VALIDATION_PROBE_* constants.
         private int mProbeResults = 0;
+        // A bitmask to record which probes are completed.
+        private int mProbeCompleted = 0;
         // The latest redirect URL.
         private String mRedirectUrl;
 
         protected void clearProbeResults() {
             mProbeResults = 0;
+            mProbeCompleted = 0;
         }
 
-        // Probe result for http probe should be updated from reportHttpProbeResult().
-        protected void noteProbeResult(int probeResult, boolean succeeded) {
-            if (succeeded) {
-                mProbeResults |= probeResult;
-            } else {
-                mProbeResults &= ~probeResult;
+        private void maybeNotifyProbeResults(@NonNull final Runnable modif) {
+            final int oldCompleted = mProbeCompleted;
+            final int oldResults = mProbeResults;
+            modif.run();
+            if (oldCompleted != mProbeCompleted || oldResults != mProbeResults) {
+                notifyProbeStatusChanged(mProbeCompleted, mProbeResults);
             }
+        }
+
+        protected void removeProbeResult(final int probeResult) {
+            maybeNotifyProbeResults(() -> {
+                mProbeCompleted &= ~probeResult;
+                mProbeResults &= ~probeResult;
+            });
+        }
+
+        protected void noteProbeResult(final int probeResult, final boolean succeeded) {
+            maybeNotifyProbeResults(() -> {
+                mProbeCompleted |= probeResult;
+                if (succeeded) {
+                    mProbeResults |= probeResult;
+                } else {
+                    mProbeResults &= ~probeResult;
+                }
+            });
         }
 
         protected void reportEvaluationResult(int result, @Nullable String redirectUrl) {
@@ -2138,6 +2183,11 @@ public class NetworkMonitor extends StateMachine {
                 return NETWORK_TEST_RESULT_INVALID;
             }
             return mEvaluationResult | mProbeResults;
+        }
+
+        @VisibleForTesting
+        protected int getProbeCompletedResult() {
+            return mProbeCompleted;
         }
     }
 
