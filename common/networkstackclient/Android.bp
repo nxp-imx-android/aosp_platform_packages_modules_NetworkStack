@@ -88,7 +88,7 @@ java_library {
         "src/android/net/ipmemorystore/**/*.java",
     ],
     static_libs: [
-        "ipmemorystore-aidl-interfaces-V3-java",
-        "networkstack-aidl-interfaces-unstable-java",
+        "ipmemorystore-aidl-interfaces-V4-java",
+        "networkstack-aidl-interfaces-V4-java",
     ],
 }
