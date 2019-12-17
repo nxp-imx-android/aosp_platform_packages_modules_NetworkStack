@@ -31,7 +31,6 @@ aidl_interface {
             enabled: false,
         },
     },
-    api_dir: "aidl/ipmemorystore",
     versions: [
         "1",
         "2",
@@ -51,6 +50,7 @@ aidl_interface {
         "src/android/net/INetworkStackConnector.aidl",
         "src/android/net/INetworkStackStatusCallback.aidl",
         "src/android/net/InitialConfigurationParcelable.aidl",
+        "src/android/net/Layer2PacketParcelable.aidl",
         "src/android/net/NattKeepalivePacketDataParcelable.aidl",
         "src/android/net/PrivateDnsConfigParcel.aidl",
         "src/android/net/ProvisioningConfigurationParcelable.aidl",
@@ -69,7 +69,6 @@ aidl_interface {
             enabled: false,
         },
     },
-    api_dir: "aidl/networkstack",
     imports: ["ipmemorystore-aidl-interfaces"],
     versions: [
         "1",

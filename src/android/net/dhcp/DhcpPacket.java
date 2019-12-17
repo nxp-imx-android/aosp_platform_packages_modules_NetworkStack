@@ -210,7 +210,8 @@ public abstract class DhcpPacket {
      * DHCP Optional Type: DHCP Requested IP Address
      */
     protected static final byte DHCP_REQUESTED_IP = 50;
-    protected Inet4Address mRequestedIp;
+    @VisibleForTesting(otherwise = VisibleForTesting.PROTECTED)
+    public Inet4Address mRequestedIp;
 
     /**
      * DHCP Optional Type: DHCP Lease Time
@@ -236,7 +237,8 @@ public abstract class DhcpPacket {
      * DHCP Optional Type: DHCP Server Identifier
      */
     protected static final byte DHCP_SERVER_IDENTIFIER = 54;
-    protected Inet4Address mServerIdentifier;
+    @VisibleForTesting(otherwise = VisibleForTesting.PROTECTED)
+    public Inet4Address mServerIdentifier;
 
     /**
      * DHCP Optional Type: DHCP Parameter List
@@ -1177,7 +1179,7 @@ public abstract class DhcpPacket {
                         "No DHCP message type option");
             case DHCP_MESSAGE_TYPE_DISCOVER:
                 newPacket = new DhcpDiscoverPacket(transactionId, secs, relayIp, clientMac,
-                        broadcast, ipSrc);
+                        broadcast, ipSrc, rapidCommit);
                 break;
             case DHCP_MESSAGE_TYPE_OFFER:
                 newPacket = new DhcpOfferPacket(
@@ -1189,12 +1191,13 @@ public abstract class DhcpPacket {
                 break;
             case DHCP_MESSAGE_TYPE_DECLINE:
                 newPacket = new DhcpDeclinePacket(
-                    transactionId, secs, clientIp, yourIp, nextIp, relayIp,
-                    clientMac);
+                    transactionId, secs, clientIp, yourIp, nextIp, relayIp, clientMac, requestedIp,
+                    serverIdentifier);
                 break;
             case DHCP_MESSAGE_TYPE_ACK:
                 newPacket = new DhcpAckPacket(
-                    transactionId, secs, broadcast, ipSrc, relayIp, clientIp, yourIp, clientMac);
+                    transactionId, secs, broadcast, ipSrc, relayIp, clientIp, yourIp, clientMac,
+                    rapidCommit);
                 break;
             case DHCP_MESSAGE_TYPE_NAK:
                 newPacket = new DhcpNakPacket(
@@ -1236,7 +1239,6 @@ public abstract class DhcpPacket {
         newPacket.mT2 = T2;
         newPacket.mVendorId = vendorId;
         newPacket.mVendorInfo = vendorInfo;
-        newPacket.mRapidCommit = rapidCommit;
         if ((optionOverload & OPTION_OVERLOAD_SNAME) == 0) {
             newPacket.mServerHostName = serverHostName;
         } else {
@@ -1328,9 +1330,8 @@ public abstract class DhcpPacket {
             short secs, byte[] clientMac, boolean broadcast, byte[] expectedParams,
             boolean rapidCommit) {
         DhcpPacket pkt = new DhcpDiscoverPacket(transactionId, secs, INADDR_ANY /* relayIp */,
-                clientMac, broadcast, INADDR_ANY /* srcIp */);
+                clientMac, broadcast, INADDR_ANY /* srcIp */, rapidCommit);
         pkt.mRequestedParams = expectedParams;
-        pkt.mRapidCommit = rapidCommit;
         return pkt.buildPacket(encap, DHCP_SERVER, DHCP_CLIENT);
     }
 
@@ -1339,11 +1340,11 @@ public abstract class DhcpPacket {
      * parameters.
      */
     public static ByteBuffer buildOfferPacket(int encap, int transactionId,
-        boolean broadcast, Inet4Address serverIpAddr, Inet4Address relayIp,
-        Inet4Address yourIp, byte[] mac, Integer timeout, Inet4Address netMask,
-        Inet4Address bcAddr, List<Inet4Address> gateways, List<Inet4Address> dnsServers,
-        Inet4Address dhcpServerIdentifier, String domainName, String hostname, boolean metered,
-        short mtu) {
+            boolean broadcast, Inet4Address serverIpAddr, Inet4Address relayIp,
+            Inet4Address yourIp, byte[] mac, Integer timeout, Inet4Address netMask,
+            Inet4Address bcAddr, List<Inet4Address> gateways, List<Inet4Address> dnsServers,
+            Inet4Address dhcpServerIdentifier, String domainName, String hostname, boolean metered,
+            short mtu) {
         DhcpPacket pkt = new DhcpOfferPacket(
                 transactionId, (short) 0, broadcast, serverIpAddr, relayIp,
                 INADDR_ANY /* clientIp */, yourIp, mac);
@@ -1366,14 +1367,14 @@ public abstract class DhcpPacket {
      * Builds a DHCP-ACK packet from the required specified parameters.
      */
     public static ByteBuffer buildAckPacket(int encap, int transactionId,
-        boolean broadcast, Inet4Address serverIpAddr, Inet4Address relayIp, Inet4Address yourIp,
-        Inet4Address requestClientIp, byte[] mac, Integer timeout, Inet4Address netMask,
-        Inet4Address bcAddr, List<Inet4Address> gateways, List<Inet4Address> dnsServers,
-        Inet4Address dhcpServerIdentifier, String domainName, String hostname, boolean metered,
-        short mtu) {
+            boolean broadcast, Inet4Address serverIpAddr, Inet4Address relayIp, Inet4Address yourIp,
+            Inet4Address requestClientIp, byte[] mac, Integer timeout, Inet4Address netMask,
+            Inet4Address bcAddr, List<Inet4Address> gateways, List<Inet4Address> dnsServers,
+            Inet4Address dhcpServerIdentifier, String domainName, String hostname, boolean metered,
+            short mtu, boolean rapidCommit) {
         DhcpPacket pkt = new DhcpAckPacket(
                 transactionId, (short) 0, broadcast, serverIpAddr, relayIp, requestClientIp, yourIp,
-                mac);
+                mac, rapidCommit);
         pkt.mGateways = gateways;
         pkt.mDnsServers = dnsServers;
         pkt.mLeaseTime = timeout;
@@ -1405,15 +1406,27 @@ public abstract class DhcpPacket {
      * Builds a DHCP-REQUEST packet from the required specified parameters.
      */
     public static ByteBuffer buildRequestPacket(int encap,
-        int transactionId, short secs, Inet4Address clientIp, boolean broadcast,
-        byte[] clientMac, Inet4Address requestedIpAddress,
-        Inet4Address serverIdentifier, byte[] requestedParams, String hostName) {
+            int transactionId, short secs, Inet4Address clientIp, boolean broadcast,
+            byte[] clientMac, Inet4Address requestedIpAddress,
+            Inet4Address serverIdentifier, byte[] requestedParams, String hostName) {
         DhcpPacket pkt = new DhcpRequestPacket(transactionId, secs, clientIp,
                 INADDR_ANY /* relayIp */, clientMac, broadcast);
         pkt.mRequestedIp = requestedIpAddress;
         pkt.mServerIdentifier = serverIdentifier;
         pkt.mHostName = hostName;
         pkt.mRequestedParams = requestedParams;
+        ByteBuffer result = pkt.buildPacket(encap, DHCP_SERVER, DHCP_CLIENT);
+        return result;
+    }
+
+    /**
+     * Builds a DHCP-DECLINE packet from the required specified parameters.
+     */
+    public static ByteBuffer buildDeclinePacket(int encap, int transactionId, byte[] clientMac,
+            Inet4Address requestedIpAddress, Inet4Address serverIdentifier) {
+        DhcpPacket pkt = new DhcpDeclinePacket(transactionId, (short) 0 /* secs */,
+                INADDR_ANY /* clientIp */, INADDR_ANY /* yourIp */, INADDR_ANY /* nextIp */,
+                INADDR_ANY /* relayIp */, clientMac, requestedIpAddress, serverIdentifier);
         ByteBuffer result = pkt.buildPacket(encap, DHCP_SERVER, DHCP_CLIENT);
         return result;
     }

@@ -27,6 +27,7 @@ import android.net.ConnectivityManager;
 import android.net.DhcpResults;
 import android.net.INetd;
 import android.net.IpPrefix;
+import android.net.Layer2PacketParcelable;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.NattKeepalivePacketDataParcelable;
@@ -38,6 +39,7 @@ import android.net.TcpKeepalivePacketDataParcelable;
 import android.net.apf.ApfCapabilities;
 import android.net.apf.ApfFilter;
 import android.net.dhcp.DhcpClient;
+import android.net.dhcp.DhcpClient.Configuration;
 import android.net.metrics.IpConnectivityLog;
 import android.net.metrics.IpManagerEvent;
 import android.net.shared.InitialConfiguration;
@@ -76,6 +78,7 @@ import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.net.InetAddress;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -178,6 +181,10 @@ public class IpClient extends StateMachine {
             mLog.e(PREFIX + msg, e);
         }
 
+        /**
+         * Callback called prior to DHCP discovery/renewal only if the pre DHCP action
+         * is enabled.
+         */
         public void onPreDhcpAction() {
             log("onPreDhcpAction()");
             try {
@@ -187,6 +194,10 @@ public class IpClient extends StateMachine {
             }
         }
 
+        /**
+         * Callback called after DHCP discovery/renewal only if the pre DHCP action
+         * is enabled.
+         */
         public void onPostDhcpAction() {
             log("onPostDhcpAction()");
             try {
@@ -196,6 +207,9 @@ public class IpClient extends StateMachine {
             }
         }
 
+        /**
+         * Callback called when new DHCP results are available.
+         */
         public void onNewDhcpResults(DhcpResults dhcpResults) {
             log("onNewDhcpResults({" + dhcpResults + "})");
             try {
@@ -205,6 +219,9 @@ public class IpClient extends StateMachine {
             }
         }
 
+        /**
+         * Indicates that provisioning was successful.
+         */
         public void onProvisioningSuccess(LinkProperties newLp) {
             log("onProvisioningSuccess({" + newLp + "})");
             try {
@@ -214,6 +231,9 @@ public class IpClient extends StateMachine {
             }
         }
 
+        /**
+         * Indicates that provisioning failed.
+         */
         public void onProvisioningFailure(LinkProperties newLp) {
             log("onProvisioningFailure({" + newLp + "})");
             try {
@@ -223,6 +243,9 @@ public class IpClient extends StateMachine {
             }
         }
 
+        /**
+         * Invoked on LinkProperties changes.
+         */
         public void onLinkPropertiesChange(LinkProperties newLp) {
             log("onLinkPropertiesChange({" + newLp + "})");
             try {
@@ -232,6 +255,10 @@ public class IpClient extends StateMachine {
             }
         }
 
+        /**
+         * Called when the internal IpReachabilityMonitor (if enabled) has detected the loss of
+         * required neighbors (e.g. on-link default gw or dns servers) due to NUD_FAILED.
+         */
         public void onReachabilityLost(String logMsg) {
             log("onReachabilityLost(" + logMsg + ")");
             try {
@@ -241,6 +268,9 @@ public class IpClient extends StateMachine {
             }
         }
 
+        /**
+         * Called when the IpClient state machine terminates.
+         */
         public void onQuit() {
             log("onQuit()");
             try {
@@ -250,6 +280,9 @@ public class IpClient extends StateMachine {
             }
         }
 
+        /**
+         * Called to indicate that a new APF program must be installed to filter incoming packets.
+         */
         public void installPacketFilter(byte[] filter) {
             log("installPacketFilter(byte[" + filter.length + "])");
             try {
@@ -259,6 +292,10 @@ public class IpClient extends StateMachine {
             }
         }
 
+        /**
+         * Called to indicate that the APF Program & data buffer must be read asynchronously from
+         * the wifi driver.
+         */
         public void startReadPacketFilter() {
             log("startReadPacketFilter()");
             try {
@@ -268,6 +305,10 @@ public class IpClient extends StateMachine {
             }
         }
 
+        /**
+         * If multicast filtering cannot be accomplished with APF, this function will be called to
+         * actuate multicast filtering using another means.
+         */
         public void setFallbackMulticastFilter(boolean enabled) {
             log("setFallbackMulticastFilter(" + enabled + ")");
             try {
@@ -277,12 +318,28 @@ public class IpClient extends StateMachine {
             }
         }
 
+        /**
+         * Enabled/disable Neighbor Discover offload functionality. This is called, for example,
+         * whenever 464xlat is being started or stopped.
+         */
         public void setNeighborDiscoveryOffload(boolean enable) {
             log("setNeighborDiscoveryOffload(" + enable + ")");
             try {
                 mCallback.setNeighborDiscoveryOffload(enable);
             } catch (RemoteException e) {
                 log("Failed to call setNeighborDiscoveryOffload", e);
+            }
+        }
+
+        /**
+         * Invoked on starting preconnection process.
+         */
+        public void onPreconnectionStart(List<Layer2PacketParcelable> packets) {
+            log("onPreconnectionStart(Layer2Packets[" + packets.size() + "])");
+            try {
+                mCallback.onPreconnectionStart(packets);
+            } catch (RemoteException e) {
+                log("Failed to call onPreconnectionStart", e);
             }
         }
     }
@@ -306,11 +363,12 @@ public class IpClient extends StateMachine {
     private static final int CMD_ADD_KEEPALIVE_PACKET_FILTER_TO_APF = 13;
     private static final int CMD_REMOVE_KEEPALIVE_PACKET_FILTER_FROM_APF = 14;
     private static final int CMD_UPDATE_L2KEY_GROUPHINT = 15;
+    protected static final int CMD_COMPLETE_PRECONNECTION = 16;
 
     // Internal commands to use instead of trying to call transitionTo() inside
     // a given State's enter() method. Calling transitionTo() from enter/exit
     // encounters a Log.wtf() that can cause trouble on eng builds.
-    private static final int CMD_JUMP_STARTED_TO_RUNNING          = 100;
+    private static final int CMD_ADDRESSES_CLEARED                = 100;
     private static final int CMD_JUMP_RUNNING_TO_STOPPING         = 101;
     private static final int CMD_JUMP_STOPPING_TO_STOPPED         = 102;
 
@@ -342,8 +400,10 @@ public class IpClient extends StateMachine {
 
     private final State mStoppedState = new StoppedState();
     private final State mStoppingState = new StoppingState();
+    private final State mClearingIpAddressesState = new ClearingIpAddressesState();
     private final State mStartedState = new StartedState();
     private final State mRunningState = new RunningState();
+    private final State mPreconnectingState = new PreconnectingState();
 
     private final String mTag;
     private final Context mContext;
@@ -606,6 +666,11 @@ public class IpClient extends StateMachine {
             enforceNetworkStackCallingPermission();
             IpClient.this.removeKeepalivePacketFilter(slot);
         }
+        @Override
+        public void notifyPreconnectionComplete(boolean success) {
+            enforceNetworkStackCallingPermission();
+            IpClient.this.notifyPreconnectionComplete(success);
+        }
 
         @Override
         public int getInterfaceVersion() {
@@ -621,6 +686,8 @@ public class IpClient extends StateMachine {
         // CHECKSTYLE:OFF IndentationCheck
         addState(mStoppedState);
         addState(mStartedState);
+            addState(mPreconnectingState, mStartedState);
+            addState(mClearingIpAddressesState, mStartedState);
             addState(mRunningState, mStartedState);
         addState(mStoppingState);
         // CHECKSTYLE:ON IndentationCheck
@@ -762,6 +829,15 @@ public class IpClient extends StateMachine {
      */
     public void removeKeepalivePacketFilter(int slot) {
         sendMessage(CMD_REMOVE_KEEPALIVE_PACKET_FILTER_FROM_APF, slot, 0 /* Unused */);
+    }
+
+    /**
+     * Notify IpClient that preconnection is complete and that the link is ready for use.
+     * The success parameter indicates whether the packets passed in by onPreconnectionStart were
+     * successfully sent to the network or not.
+     */
+    public void notifyPreconnectionComplete(boolean success) {
+        sendMessage(CMD_COMPLETE_PRECONNECTION, success ? 1 : 0);
     }
 
     /**
@@ -1227,11 +1303,10 @@ public class IpClient extends StateMachine {
                 return false;
             }
         } else {
-            // Start DHCPv4.
-            mDhcpClient = DhcpClient.makeDhcpClient(mContext, IpClient.this, mInterfaceParams,
-                    mDependencies.getDhcpClientDependencies(mIpMemoryStore));
-            mDhcpClient.registerForPreDhcpNotification();
-            mDhcpClient.sendMessage(DhcpClient.CMD_START_DHCP, mL2Key);
+            if (mDhcpClient != null) {
+                Log.wtf(mTag, "DhcpClient should never be non-null in startIPv4()");
+            }
+            startDhcpClient();
         }
 
         return true;
@@ -1355,7 +1430,7 @@ public class IpClient extends StateMachine {
 
                 case CMD_START:
                     mConfiguration = (android.net.shared.ProvisioningConfiguration) msg.obj;
-                    transitionTo(mStartedState);
+                    transitionTo(mClearingIpAddressesState);
                     break;
 
                 case EVENT_NETLINK_LINKPROPERTIES_CHANGED:
@@ -1437,6 +1512,109 @@ public class IpClient extends StateMachine {
         }
     }
 
+    private boolean isUsingPreconnection() {
+        return mConfiguration.mEnablePreconnection && mConfiguration.mStaticIpConfig == null;
+    }
+
+    private void startDhcpClient() {
+        // Start DHCPv4.
+        mDhcpClient = DhcpClient.makeDhcpClient(mContext, IpClient.this, mInterfaceParams,
+                mDependencies.getDhcpClientDependencies(mIpMemoryStore));
+
+        // If preconnection is enabled, there is no need to ask Wi-Fi to disable powersaving
+        // during DHCP, because the DHCP handshake will happen during association. In order to
+        // ensure that future renews still do the DHCP action (if configured),
+        // registerForPreDhcpNotification is called later when processing the CMD_*_PRECONNECTION
+        // messages.
+        if (!isUsingPreconnection()) mDhcpClient.registerForPreDhcpNotification();
+        mDhcpClient.sendMessage(DhcpClient.CMD_START_DHCP, new Configuration(mL2Key,
+                isUsingPreconnection()));
+    }
+
+    class ClearingIpAddressesState extends State {
+        @Override
+        public void enter() {
+            if (readyToProceed()) {
+                deferMessage(obtainMessage(CMD_ADDRESSES_CLEARED));
+            } else {
+                // Clear all IPv4 and IPv6 before proceeding to RunningState.
+                // Clean up any leftover state from an abnormal exit from
+                // tethering or during an IpClient restart.
+                stopAllIP();
+            }
+        }
+
+        @Override
+        public boolean processMessage(Message msg) {
+            switch (msg.what) {
+                case CMD_ADDRESSES_CLEARED:
+                    transitionTo(isUsingPreconnection() ? mPreconnectingState : mRunningState);
+                    break;
+
+                case EVENT_NETLINK_LINKPROPERTIES_CHANGED:
+                    handleLinkPropertiesUpdate(NO_CALLBACKS);
+                    if (readyToProceed()) {
+                        transitionTo(mRunningState);
+                    }
+                    break;
+
+                case CMD_STOP:
+                case EVENT_PROVISIONING_TIMEOUT:
+                    // Fall through to StartedState.
+                    return NOT_HANDLED;
+
+                default:
+                    // It's safe to process messages out of order because the
+                    // only message that can both
+                    //     a) be received at this time and
+                    //     b) affect provisioning state
+                    // is EVENT_NETLINK_LINKPROPERTIES_CHANGED (handled above).
+                    deferMessage(msg);
+            }
+            return HANDLED;
+        }
+
+        private boolean readyToProceed() {
+            return (!mLinkProperties.hasIpv4Address() && !mLinkProperties.hasGlobalIpv6Address());
+        }
+    }
+
+    class PreconnectingState extends State {
+        @Override
+        public void enter() {
+            startDhcpClient();
+        }
+
+        @Override
+        public boolean processMessage(Message msg) {
+            switch (msg.what) {
+                case CMD_COMPLETE_PRECONNECTION:
+                    boolean success = (msg.arg1 == 1);
+                    mDhcpClient.registerForPreDhcpNotification();
+                    if (!success) {
+                        mDhcpClient.sendMessage(DhcpClient.CMD_ABORT_PRECONNECTION);
+                    }
+                    // The link is ready for use. Advance to running state, start IPv6, etc.
+                    transitionTo(mRunningState);
+                    break;
+
+                case DhcpClient.CMD_START_PRECONNECTION:
+                    final Layer2PacketParcelable l2Packet = (Layer2PacketParcelable) msg.obj;
+                    mCallback.onPreconnectionStart(Collections.singletonList(l2Packet));
+                    break;
+
+                case CMD_STOP:
+                case EVENT_PROVISIONING_TIMEOUT:
+                    // Fall through to StartedState.
+                    return NOT_HANDLED;
+
+                default:
+                    deferMessage(msg);
+            }
+            return HANDLED;
+        }
+    }
+
     class StartedState extends State {
         @Override
         public void enter() {
@@ -1445,15 +1623,6 @@ public class IpClient extends StateMachine {
                 final long alarmTime = SystemClock.elapsedRealtime()
                         + mConfiguration.mProvisioningTimeoutMs;
                 mProvisioningTimeoutAlarm.schedule(alarmTime);
-            }
-
-            if (readyToProceed()) {
-                deferMessage(obtainMessage(CMD_JUMP_STARTED_TO_RUNNING));
-            } else {
-                // Clear all IPv4 and IPv6 before proceeding to RunningState.
-                // Clean up any leftover state from an abnormal exit from
-                // tethering or during an IpClient restart.
-                stopAllIP();
             }
         }
 
@@ -1465,19 +1634,8 @@ public class IpClient extends StateMachine {
         @Override
         public boolean processMessage(Message msg) {
             switch (msg.what) {
-                case CMD_JUMP_STARTED_TO_RUNNING:
-                    transitionTo(mRunningState);
-                    break;
-
                 case CMD_STOP:
                     transitionTo(mStoppingState);
-                    break;
-
-                case EVENT_NETLINK_LINKPROPERTIES_CHANGED:
-                    handleLinkPropertiesUpdate(NO_CALLBACKS);
-                    if (readyToProceed()) {
-                        transitionTo(mRunningState);
-                    }
                     break;
 
                 case CMD_UPDATE_L2KEY_GROUPHINT: {
@@ -1497,21 +1655,13 @@ public class IpClient extends StateMachine {
                 case EVENT_PROVISIONING_TIMEOUT:
                     handleProvisioningFailure();
                     break;
+
                 default:
-                    // It's safe to process messages out of order because the
-                    // only message that can both
-                    //     a) be received at this time and
-                    //     b) affect provisioning state
-                    // is EVENT_NETLINK_LINKPROPERTIES_CHANGED (handled above).
-                    deferMessage(msg);
+                    return NOT_HANDLED;
             }
 
             mMsgStateLogger.handled(this, getCurrentState());
             return HANDLED;
-        }
-
-        private boolean readyToProceed() {
-            return (!mLinkProperties.hasIpv4Address() && !mLinkProperties.hasGlobalIpv6Address());
         }
     }
 
@@ -1544,7 +1694,7 @@ public class IpClient extends StateMachine {
                 return;
             }
 
-            if (mConfiguration.mEnableIPv4 && !startIPv4()) {
+            if (mConfiguration.mEnableIPv4 && !isUsingPreconnection() && !startIPv4()) {
                 doImmediateProvisioningFailure(IpManagerEvent.ERROR_STARTING_IPV4);
                 enqueueJumpToStoppingState();
                 return;
