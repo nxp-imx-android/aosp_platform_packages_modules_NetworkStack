@@ -19,13 +19,14 @@ package android.net.util;
 import static android.os.MessageQueue.OnFileDescriptorEventListener.EVENT_ERROR;
 import static android.os.MessageQueue.OnFileDescriptorEventListener.EVENT_INPUT;
 
-import android.annotation.NonNull;
-import android.annotation.Nullable;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.MessageQueue;
 import android.system.ErrnoException;
 import android.system.OsConstants;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -63,7 +64,6 @@ import java.io.IOException;
  * the Handler constructor argument is associated.
  *
  * @param <BufferType> the type of the buffer used to read data.
- * @hide
  */
 public abstract class FdEventsReader<BufferType> {
     private static final int FD_EVENTS = EVENT_INPUT | EVENT_ERROR;
@@ -93,27 +93,21 @@ public abstract class FdEventsReader<BufferType> {
     }
 
     /** Start this FdEventsReader. */
-    public void start() {
-        if (onCorrectThread()) {
-            createAndRegisterFd();
-        } else {
-            mHandler.post(() -> {
-                logError("start() called from off-thread", null);
-                createAndRegisterFd();
-            });
+    public boolean start() {
+        if (!onCorrectThread()) {
+            throw new IllegalStateException("start() called from off-thread");
         }
+
+        return createAndRegisterFd();
     }
 
     /** Stop this FdEventsReader and destroy the file descriptor. */
     public void stop() {
-        if (onCorrectThread()) {
-            unregisterAndDestroyFd();
-        } else {
-            mHandler.post(() -> {
-                logError("stop() called from off-thread", null);
-                unregisterAndDestroyFd();
-            });
+        if (!onCorrectThread()) {
+            throw new IllegalStateException("stop() called from off-thread");
         }
+
+        unregisterAndDestroyFd();
     }
 
     @NonNull
@@ -178,8 +172,8 @@ public abstract class FdEventsReader<BufferType> {
      */
     protected void onStop() {}
 
-    private void createAndRegisterFd() {
-        if (mFd != null) return;
+    private boolean createAndRegisterFd() {
+        if (mFd != null) return true;
 
         try {
             mFd = createFd();
@@ -189,7 +183,7 @@ public abstract class FdEventsReader<BufferType> {
             mFd = null;
         }
 
-        if (mFd == null) return;
+        if (mFd == null) return false;
 
         mQueue.addOnFileDescriptorEventListener(
                 mFd,
@@ -205,6 +199,7 @@ public abstract class FdEventsReader<BufferType> {
                     return FD_EVENTS;
                 });
         onStart();
+        return true;
     }
 
     private boolean isRunning() {

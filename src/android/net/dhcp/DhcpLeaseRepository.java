@@ -27,13 +27,14 @@ import static com.android.server.util.NetworkStackConstants.IPV4_ADDR_BITS;
 
 import static java.lang.Math.min;
 
-import android.annotation.NonNull;
-import android.annotation.Nullable;
 import android.net.IpPrefix;
 import android.net.MacAddress;
 import android.net.dhcp.DhcpServer.Clock;
 import android.net.util.SharedLog;
 import android.util.ArrayMap;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import java.net.Inet4Address;
 import java.util.ArrayList;
@@ -186,6 +187,25 @@ class DhcpLeaseRepository {
             newLease = makeNewOffer(clientId, hwAddr, expTime, hostname);
             mLog.log("Offering new generated lease " + newLease);
         }
+        return newLease;
+    }
+
+    /**
+     * Get a rapid committed DHCP Lease, to reply to a DHCPDISCOVER w/ Rapid Commit option.
+     *
+     * @param clientId Client identifier option if specified, or {@link #CLIENTID_UNSPEC}
+     * @param relayAddr Internet address of the relay (giaddr), can be {@link Inet4Address#ANY}
+     * @param hostname Client-provided hostname, or {@link DhcpLease#HOSTNAME_NONE}
+     * @throws OutOfAddressesException The server does not have any available address
+     * @throws InvalidSubnetException The lease was requested from an unsupported subnet
+     */
+    @NonNull
+    public DhcpLease getCommittedLease(@Nullable byte[] clientId, @NonNull MacAddress hwAddr,
+            @NonNull Inet4Address relayAddr, @Nullable String hostname)
+            throws OutOfAddressesException, InvalidSubnetException {
+        final DhcpLease newLease = getOffer(clientId, hwAddr, relayAddr, null /* reqAddr */,
+                hostname);
+        commitLease(newLease);
         return newLease;
     }
 

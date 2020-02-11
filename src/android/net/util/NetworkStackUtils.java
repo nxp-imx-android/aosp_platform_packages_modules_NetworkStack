@@ -16,13 +16,14 @@
 
 package android.net.util;
 
-import android.annotation.NonNull;
-import android.annotation.Nullable;
 import android.content.Context;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.provider.DeviceConfig;
 import android.util.Log;
 import android.util.SparseArray;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -111,14 +112,34 @@ public class NetworkStackUtils {
     public static final int CAPTIVE_PORTAL_MODE_AVOID = 2;
 
     /**
-     * Experiment flag to enable DHCP INIT-REBOOT state, default value is false.
+     * @deprecated Considering boolean experiment flag is likely to cause misconfiguration
+     *             particularly when NetworkStack module rolls back to previous version. It's
+     *             much safer to determine whether or not to enable one specific experimental
+     *             feature by comparing flag version with module version.
      */
+    @Deprecated
     public static final String DHCP_INIT_REBOOT_ENABLED = "dhcp_init_reboot_enabled";
 
     /**
-     * Experiment flag to enable DHCP Rapid Commit option, default value is false.
+     * @deprecated See above explanation.
      */
+    @Deprecated
     public static final String DHCP_RAPID_COMMIT_ENABLED = "dhcp_rapid_commit_enabled";
+
+    /**
+     * Minimum module version at which to enable the DHCP INIT-REBOOT state.
+     */
+    public static final String DHCP_INIT_REBOOT_VERSION = "dhcp_init_reboot_version";
+
+    /**
+     * Minimum module version at which to enable the DHCP Rapid Commit option.
+     */
+    public static final String DHCP_RAPID_COMMIT_VERSION = "dhcp_rapid_commit_version";
+
+    /**
+     * Minimum module version at which to enable the IP address conflict detection feature.
+     */
+    public static final String DHCP_IP_CONFLICT_DETECT_VERSION = "dhcp_ip_conflict_detect_version";
 
     static {
         System.loadLibrary("networkstackutilsjni");
@@ -205,6 +226,23 @@ public class NetworkStackUtils {
         } catch (NumberFormatException e) {
             return defaultValue;
         }
+    }
+
+    /**
+     * Look up the value of a property for a particular namespace from {@link DeviceConfig}.
+     * @param namespace The namespace containing the property to look up.
+     * @param name The name of the property to look up.
+     * @param minimumValue The minimum value of a property.
+     * @param maximumValue The maximum value of a property.
+     * @param defaultValue The value to return if the property does not exist or its value is null.
+     * @return the corresponding value, or defaultValue if none exists or the fetched value is
+     *         greater than maximumValue.
+     */
+    public static int getDeviceConfigPropertyInt(@NonNull String namespace, @NonNull String name,
+            int minimumValue, int maximumValue, int defaultValue) {
+        int value = getDeviceConfigPropertyInt(namespace, name, defaultValue);
+        if (value < minimumValue || value > maximumValue) return defaultValue;
+        return value;
     }
 
     /**

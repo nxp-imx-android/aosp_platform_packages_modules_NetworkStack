@@ -26,16 +26,6 @@ import java.net.Inet4Address;
 public final class NetworkStackConstants {
 
     /**
-     * IPv4 constants.
-     *
-     * See also:
-     *     - https://tools.ietf.org/html/rfc791
-     */
-    public static final int IPV4_ADDR_BITS = 32;
-    public static final int IPV4_MIN_MTU = 68;
-    public static final int IPV4_MAX_MTU = 65_535;
-
-    /**
      * Ethernet constants.
      *
      * See also:
@@ -64,6 +54,7 @@ public final class NetworkStackConstants {
      *     - http://www.iana.org/assignments/arp-parameters/arp-parameters.xhtml
      */
     public static final int ARP_PAYLOAD_LEN = 28;  // For Ethernet+IPv4.
+    public static final int ARP_ETHER_IPV4_LEN = ARP_PAYLOAD_LEN + ETHER_HEADER_LEN;
     public static final int ARP_REQUEST = 1;
     public static final int ARP_REPLY   = 2;
     public static final int ARP_HWTYPE_RESERVED_LO = 0;
@@ -71,11 +62,23 @@ public final class NetworkStackConstants {
     public static final int ARP_HWTYPE_RESERVED_HI = 0xffff;
 
     /**
+     * IPv4 Address Conflict Detection constants.
+     *
+     * See also:
+     *     - https://tools.ietf.org/html/rfc5227
+     */
+    public static final int IPV4_CONFLICT_PROBE_NUM = 3;
+    public static final int IPV4_CONFLICT_ANNOUNCE_NUM = 2;
+
+    /**
      * IPv4 constants.
      *
      * See also:
      *     - https://tools.ietf.org/html/rfc791
      */
+    public static final int IPV4_ADDR_BITS = 32;
+    public static final int IPV4_MIN_MTU = 68;
+    public static final int IPV4_MAX_MTU = 65_535;
     public static final int IPV4_HEADER_MIN_LEN = 20;
     public static final int IPV4_IHL_MASK = 0xf;
     public static final int IPV4_FLAGS_OFFSET = 6;
@@ -95,6 +98,7 @@ public final class NetworkStackConstants {
      */
     public static final int IPV6_ADDR_LEN = 16;
     public static final int IPV6_HEADER_LEN = 40;
+    public static final int IPV6_LEN_OFFSET = 4;
     public static final int IPV6_PROTOCOL_OFFSET = 6;
     public static final int IPV6_SRC_ADDR_OFFSET = 8;
     public static final int IPV6_DST_ADDR_OFFSET = 24;
@@ -108,6 +112,7 @@ public final class NetworkStackConstants {
      *     - https://tools.ietf.org/html/rfc4861
      */
     public static final int ICMPV6_HEADER_MIN_LEN = 4;
+    public static final int ICMPV6_CHECKSUM_OFFSET = 2;
     public static final int ICMPV6_ECHO_REPLY_TYPE = 129;
     public static final int ICMPV6_ECHO_REQUEST_TYPE = 128;
     public static final int ICMPV6_ROUTER_SOLICITATION    = 133;
@@ -116,9 +121,14 @@ public final class NetworkStackConstants {
     public static final int ICMPV6_NEIGHBOR_ADVERTISEMENT = 136;
     public static final int ICMPV6_ND_OPTION_MIN_LENGTH = 8;
     public static final int ICMPV6_ND_OPTION_LENGTH_SCALING_FACTOR = 8;
-    public static final int ICMPV6_ND_OPTION_SLLA = 1;
-    public static final int ICMPV6_ND_OPTION_TLLA = 2;
-    public static final int ICMPV6_ND_OPTION_MTU  = 5;
+    public static final int ICMPV6_ND_OPTION_SLLA  = 1;
+    public static final int ICMPV6_ND_OPTION_TLLA  = 2;
+    public static final int ICMPV6_ND_OPTION_PIO   = 3;
+    public static final int ICMPV6_ND_OPTION_MTU   = 5;
+    public static final int ICMPV6_ND_OPTION_RDNSS = 25;
+
+
+    public static final int ICMPV6_RA_HEADER_LEN = 16;
 
     /**
      * UDP constants.
