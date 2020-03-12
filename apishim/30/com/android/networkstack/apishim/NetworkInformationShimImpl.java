@@ -25,6 +25,8 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 
+import java.net.Inet4Address;
+
 /**
  * Compatibility implementation of {@link NetworkInformationShim}.
  */
@@ -71,7 +73,7 @@ public class NetworkInformationShimImpl extends
 
     @Nullable
     @Override
-    public String getSSID(@Nullable NetworkCapabilities nc) {
+    public String getSsid(@Nullable NetworkCapabilities nc) {
         if (nc == null) return null;
         return nc.getSSID();
     }
@@ -80,5 +82,11 @@ public class NetworkInformationShimImpl extends
     @Override
     public LinkProperties makeSensitiveFieldsParcelingCopy(@NonNull final LinkProperties lp) {
         return lp.makeSensitiveFieldsParcelingCopy();
+    }
+
+    @Override
+    public void setDhcpServerAddress(@NonNull LinkProperties lp,
+            @NonNull Inet4Address serverAddress) {
+        lp.setDhcpServerAddress(serverAddress);
     }
 }
