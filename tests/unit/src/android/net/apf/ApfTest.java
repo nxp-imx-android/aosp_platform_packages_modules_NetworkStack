@@ -26,7 +26,6 @@ import static android.system.OsConstants.IPPROTO_TCP;
 import static android.system.OsConstants.IPPROTO_UDP;
 import static android.system.OsConstants.SOCK_STREAM;
 
-import static com.android.internal.util.BitUtils.bytesToBEInt;
 import static com.android.server.util.NetworkStackConstants.ICMPV6_ECHO_REQUEST_TYPE;
 import static com.android.server.util.NetworkStackConstants.IPV6_ADDR_LEN;
 
@@ -39,6 +38,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 
 import android.content.Context;
+import android.net.InetAddresses;
 import android.net.IpPrefix;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
@@ -51,6 +51,7 @@ import android.net.ip.IIpClientCallbacks;
 import android.net.ip.IpClient.IpClientCallbacksWrapper;
 import android.net.metrics.IpConnectivityLog;
 import android.net.metrics.RaEvent;
+import android.net.shared.Inet4AddressUtils;
 import android.net.util.InterfaceParams;
 import android.net.util.SharedLog;
 import android.os.ConditionVariable;
@@ -66,6 +67,7 @@ import androidx.test.filters.SmallTest;
 import androidx.test.runner.AndroidJUnit4;
 
 import com.android.internal.util.HexDump;
+import com.android.networkstack.apishim.NetworkInformationShimImpl;
 import com.android.server.networkstack.tests.R;
 import com.android.server.util.NetworkStackConstants;
 
@@ -85,6 +87,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
@@ -934,7 +937,8 @@ public class ApfTest {
         private byte[] mLastApfProgram;
 
         MockIpClientCallback() {
-            super(mock(IIpClientCallbacks.class), mock(SharedLog.class));
+            super(mock(IIpClientCallbacks.class), mock(SharedLog.class),
+                    NetworkInformationShimImpl.newInstance());
         }
 
         @Override
@@ -2303,7 +2307,8 @@ public class ApfTest {
     }
 
     public void assertEqualsIp(String expected, int got) throws Exception {
-        int want = bytesToBEInt(InetAddress.getByName(expected).getAddress());
+        int want = Inet4AddressUtils.inet4AddressToIntHTH(
+                (Inet4Address) InetAddresses.parseNumericAddress(expected));
         assertEquals(want, got);
     }
 }

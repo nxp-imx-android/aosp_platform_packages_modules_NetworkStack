@@ -16,15 +16,23 @@
 
 package android.net;
 
+import android.net.CaptivePortalData;
 import android.net.INetworkMonitor;
 import android.net.PrivateDnsConfigParcel;
 
 /** @hide */
 oneway interface INetworkMonitorCallbacks {
     void onNetworkMonitorCreated(in INetworkMonitor networkMonitor);
+
+    // Deprecated. Use notifyNetworkTestedWithExtras() instead.
     void notifyNetworkTested(int testResult, @nullable String redirectUrl);
     void notifyPrivateDnsConfigResolved(in PrivateDnsConfigParcel config);
     void showProvisioningNotification(String action, String packageName);
     void hideProvisioningNotification();
     void notifyProbeStatusChanged(int probesCompleted, int probesSucceeded);
+    void notifyNetworkTestedWithExtras(int testResult, @nullable String redirectUrl,
+            long timestampMillis, in PersistableBundle extras);
+    void notifyDataStallSuspected(long timestampMillis, int detectionMethod,
+            in PersistableBundle extras);
+    void notifyCaptivePortalDataChanged(in CaptivePortalData data);
 }

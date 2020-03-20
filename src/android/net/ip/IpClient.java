@@ -20,6 +20,7 @@ import static android.net.RouteInfo.RTN_UNICAST;
 import static android.net.shared.IpConfigurationParcelableUtil.toStableParcelable;
 import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 
+import static com.android.server.util.NetworkStackConstants.VENDOR_SPECIFIC_IE_ID;
 import static com.android.server.util.PermissionUtil.enforceNetworkStackCallingPermission;
 
 import android.content.Context;
@@ -36,14 +37,17 @@ import android.net.ProvisioningConfigurationParcelable;
 import android.net.ProxyInfo;
 import android.net.RouteInfo;
 import android.net.TcpKeepalivePacketDataParcelable;
+import android.net.Uri;
 import android.net.apf.ApfCapabilities;
 import android.net.apf.ApfFilter;
 import android.net.dhcp.DhcpClient;
-import android.net.dhcp.DhcpClient.Configuration;
+import android.net.dhcp.DhcpPacket;
 import android.net.metrics.IpConnectivityLog;
 import android.net.metrics.IpManagerEvent;
 import android.net.shared.InitialConfiguration;
 import android.net.shared.ProvisioningConfiguration;
+import android.net.shared.ProvisioningConfiguration.ScanResultInfo;
+import android.net.shared.ProvisioningConfiguration.ScanResultInfo.InformationElement;
 import android.net.util.InterfaceParams;
 import android.net.util.NetworkStackUtils;
 import android.net.util.SharedLog;
@@ -58,11 +62,13 @@ import android.text.TextUtils;
 import android.util.LocalLog;
 import android.util.Log;
 import android.util.Pair;
+import android.util.Patterns;
 import android.util.SparseArray;
 
 import androidx.annotation.NonNull;
 
 import com.android.internal.annotations.VisibleForTesting;
+import com.android.internal.util.HexDump;
 import com.android.internal.util.IState;
 import com.android.internal.util.IndentingPrintWriter;
 import com.android.internal.util.MessageUtils;
@@ -70,6 +76,8 @@ import com.android.internal.util.Preconditions;
 import com.android.internal.util.State;
 import com.android.internal.util.StateMachine;
 import com.android.internal.util.WakeupMessage;
+import com.android.networkstack.apishim.NetworkInformationShim;
+import com.android.networkstack.apishim.NetworkInformationShimImpl;
 import com.android.networkstack.apishim.ShimUtils;
 import com.android.server.NetworkObserverRegistry;
 import com.android.server.NetworkStackService.NetworkStackServiceManager;
@@ -77,6 +85,10 @@ import com.android.server.NetworkStackService.NetworkStackServiceManager;
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.net.InetAddress;
+import java.nio.BufferUnderflowException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -113,6 +125,7 @@ public class IpClient extends StateMachine {
     private static final ConcurrentHashMap<String, SharedLog> sSmLogs = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, LocalLog> sPktLogs = new ConcurrentHashMap<>();
     private final NetworkStackIpMemoryStore mIpMemoryStore;
+    private final NetworkInformationShim mShim = NetworkInformationShimImpl.newInstance();
 
     /**
      * Dump all state machine and connectivity packet logs to the specified writer.
@@ -166,11 +179,15 @@ public class IpClient extends StateMachine {
         private static final String PREFIX = "INVOKE ";
         private final IIpClientCallbacks mCallback;
         private final SharedLog mLog;
+        @NonNull
+        private final NetworkInformationShim mShim;
 
         @VisibleForTesting
-        protected IpClientCallbacksWrapper(IIpClientCallbacks callback, SharedLog log) {
+        protected IpClientCallbacksWrapper(IIpClientCallbacks callback, SharedLog log,
+                @NonNull NetworkInformationShim shim) {
             mCallback = callback;
             mLog = log;
+            mShim = shim;
         }
 
         private void log(String msg) {
@@ -225,7 +242,7 @@ public class IpClient extends StateMachine {
         public void onProvisioningSuccess(LinkProperties newLp) {
             log("onProvisioningSuccess({" + newLp + "})");
             try {
-                mCallback.onProvisioningSuccess(newLp);
+                mCallback.onProvisioningSuccess(mShim.makeSensitiveFieldsParcelingCopy(newLp));
             } catch (RemoteException e) {
                 log("Failed to call onProvisioningSuccess", e);
             }
@@ -237,7 +254,7 @@ public class IpClient extends StateMachine {
         public void onProvisioningFailure(LinkProperties newLp) {
             log("onProvisioningFailure({" + newLp + "})");
             try {
-                mCallback.onProvisioningFailure(newLp);
+                mCallback.onProvisioningFailure(mShim.makeSensitiveFieldsParcelingCopy(newLp));
             } catch (RemoteException e) {
                 log("Failed to call onProvisioningFailure", e);
             }
@@ -249,7 +266,7 @@ public class IpClient extends StateMachine {
         public void onLinkPropertiesChange(LinkProperties newLp) {
             log("onLinkPropertiesChange({" + newLp + "})");
             try {
-                mCallback.onLinkPropertiesChange(newLp);
+                mCallback.onLinkPropertiesChange(mShim.makeSensitiveFieldsParcelingCopy(newLp));
             } catch (RemoteException e) {
                 log("Failed to call onLinkPropertiesChange", e);
             }
@@ -398,6 +415,13 @@ public class IpClient extends StateMachine {
     private static final int PROV_CHANGE_GAINED_PROVISIONING = 3;
     private static final int PROV_CHANGE_STILL_PROVISIONED = 4;
 
+    // Specific vendor OUI(3 bytes)/vendor specific type(1 byte) pattern for upstream hotspot
+    // device detection. Add new byte array pattern below in turn.
+    private static final List<byte[]> METERED_IE_PATTERN_LIST = Collections.unmodifiableList(
+            Arrays.asList(
+                    new byte[] { (byte) 0x00, (byte) 0x17, (byte) 0xf2, (byte) 0x06 }
+    ));
+
     private final State mStoppedState = new StoppedState();
     private final State mStoppingState = new StoppingState();
     private final State mClearingIpAddressesState = new ClearingIpAddressesState();
@@ -478,6 +502,14 @@ public class IpClient extends StateMachine {
         }
 
         /**
+         * Get a DhcpClient instance.
+         */
+        public DhcpClient makeDhcpClient(Context context, StateMachine controller,
+                InterfaceParams ifParams, DhcpClient.Dependencies deps) {
+            return DhcpClient.makeDhcpClient(context, controller, ifParams, deps);
+        }
+
+        /**
          * Get a DhcpClient Dependencies instance.
          */
         public DhcpClient.Dependencies getDhcpClientDependencies(
@@ -523,7 +555,7 @@ public class IpClient extends StateMachine {
         sPktLogs.putIfAbsent(mInterfaceName, new LocalLog(MAX_PACKET_RECORDS));
         mConnectivityPacketLog = sPktLogs.get(mInterfaceName);
         mMsgStateLogger = new MessageHandlingLogger();
-        mCallback = new IpClientCallbacksWrapper(callback, mLog);
+        mCallback = new IpClientCallbacksWrapper(callback, mLog, mShim);
 
         // TODO: Consider creating, constructing, and passing in some kind of
         // InterfaceController.Dependencies class.
@@ -675,6 +707,11 @@ public class IpClient extends StateMachine {
         @Override
         public int getInterfaceVersion() {
             return this.VERSION;
+        }
+
+        @Override
+        public String getInterfaceHash() {
+            return this.HASH;
         }
     }
 
@@ -1173,6 +1210,19 @@ public class IpClient extends StateMachine {
             if (mDhcpResults.mtu != 0) {
                 newLp.setMtu(mDhcpResults.mtu);
             }
+
+            if (mDhcpResults.serverAddress != null) {
+                mShim.setDhcpServerAddress(newLp, mDhcpResults.serverAddress);
+            }
+
+            final String capportUrl = mDhcpResults.captivePortalApiUrl;
+            // Uri.parse does no syntax check; do a simple regex check to eliminate garbage.
+            // If the URL is still incorrect data fetching will fail later, which is fine.
+            if (capportUrl != null && Patterns.WEB_URL.matcher(capportUrl).matches()) {
+                NetworkInformationShimImpl.newInstance()
+                        .setCaptivePortalApiUrl(newLp, Uri.parse(capportUrl));
+            }
+            // TODO: also look at the IPv6 RA (netlink) for captive portal URL
         }
 
         // [4] Add in TCP buffer sizes and HTTP Proxy config, if available.
@@ -1235,15 +1285,71 @@ public class IpClient extends StateMachine {
         return (delta != PROV_CHANGE_LOST_PROVISIONING);
     }
 
+    @VisibleForTesting
+    static String removeDoubleQuotes(@NonNull String ssid) {
+        final int length = ssid.length();
+        if ((length > 1) && (ssid.charAt(0) == '"') && (ssid.charAt(length - 1) == '"')) {
+            return ssid.substring(1, length - 1);
+        }
+        return ssid;
+    }
+
+    private List<ByteBuffer> getVendorSpecificIEs(@NonNull ScanResultInfo scanResultInfo) {
+        ArrayList<ByteBuffer> vendorSpecificPayloadList = new ArrayList<>();
+        for (InformationElement ie : scanResultInfo.getInformationElements()) {
+            if (ie.getId() == VENDOR_SPECIFIC_IE_ID) {
+                vendorSpecificPayloadList.add(ie.getPayload());
+            }
+        }
+        return vendorSpecificPayloadList;
+    }
+
+    private boolean detectUpstreamHotspotFromVendorIe() {
+        if (mConfiguration.mScanResultInfo == null) return false;
+        final ScanResultInfo scanResultInfo = mConfiguration.mScanResultInfo;
+        final String ssid = scanResultInfo.getSsid();
+        final List<ByteBuffer> vendorSpecificPayloadList = getVendorSpecificIEs(scanResultInfo);
+
+        if (mConfiguration.mDisplayName == null
+                || !removeDoubleQuotes(mConfiguration.mDisplayName).equals(ssid)) {
+            return false;
+        }
+
+        for (ByteBuffer payload : vendorSpecificPayloadList) {
+            byte[] ouiAndType = new byte[4];
+            try {
+                payload.get(ouiAndType);
+            } catch (BufferUnderflowException e) {
+                Log.e(mTag, "Couldn't parse vendor specific IE, buffer underflow");
+                return false;
+            }
+            for (byte[] pattern : METERED_IE_PATTERN_LIST) {
+                if (Arrays.equals(pattern, ouiAndType)) {
+                    if (DBG) {
+                        Log.d(mTag, "detected upstream hotspot that matches OUI:"
+                                + HexDump.toHexString(ouiAndType));
+                    }
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private void handleIPv4Success(DhcpResults dhcpResults) {
         mDhcpResults = new DhcpResults(dhcpResults);
         final LinkProperties newLp = assembleLinkProperties();
         final int delta = setLinkProperties(newLp);
 
-        if (DBG) {
-            Log.d(mTag, "onNewDhcpResults(" + Objects.toString(dhcpResults) + ")");
+        if (mDhcpResults.vendorInfo == null && detectUpstreamHotspotFromVendorIe()) {
+            mDhcpResults.vendorInfo = DhcpPacket.VENDOR_INFO_ANDROID_METERED;
         }
-        mCallback.onNewDhcpResults(dhcpResults);
+
+        if (DBG) {
+            Log.d(mTag, "onNewDhcpResults(" + Objects.toString(mDhcpResults) + ")");
+            Log.d(mTag, "handleIPv4Success newLp{" + newLp + "}");
+        }
+        mCallback.onNewDhcpResults(mDhcpResults);
         maybeSaveNetworkToIpMemoryStore();
 
         dispatchCallback(delta, newLp);
@@ -1290,7 +1396,7 @@ public class IpClient extends StateMachine {
     private void doImmediateProvisioningFailure(int failureType) {
         logError("onProvisioningFailure(): %s", failureType);
         recordMetric(failureType);
-        mCallback.onProvisioningFailure(new LinkProperties(mLinkProperties));
+        mCallback.onProvisioningFailure(mLinkProperties);
     }
 
     private boolean startIPv4() {
@@ -1329,19 +1435,6 @@ public class IpClient extends StateMachine {
 
     private boolean startIpReachabilityMonitor() {
         try {
-            // TODO: Fetch these parameters from settings, and install a
-            // settings observer to watch for update and re-program these
-            // parameters (Q: is this level of dynamic updatability really
-            // necessary or does reading from settings at startup suffice?).
-            final int numSolicits = 5;
-            final int interSolicitIntervalMs = 750;
-            setNeighborParameters(mNetd, mInterfaceName, numSolicits, interSolicitIntervalMs);
-        } catch (Exception e) {
-            mLog.e("Failed to adjust neighbor parameters", e);
-            // Carry on using the system defaults (currently: 3, 1000);
-        }
-
-        try {
             mIpReachabilityMonitor = new IpReachabilityMonitor(
                     mContext,
                     mInterfaceParams,
@@ -1353,7 +1446,8 @@ public class IpClient extends StateMachine {
                             mCallback.onReachabilityLost(logMsg);
                         }
                     },
-                    mConfiguration.mUsingMultinetworkPolicyTracker);
+                    mConfiguration.mUsingMultinetworkPolicyTracker,
+                    mNetd);
         } catch (IllegalArgumentException iae) {
             // Failed to start IpReachabilityMonitor. Log it and call
             // onProvisioningFailure() immediately.
@@ -1411,7 +1505,7 @@ public class IpClient extends StateMachine {
             if (mStartTimeMillis > 0) {
                 // Completed a life-cycle; send a final empty LinkProperties
                 // (cleared in resetLinkProperties() above) and record an event.
-                mCallback.onLinkPropertiesChange(new LinkProperties(mLinkProperties));
+                mCallback.onLinkPropertiesChange(mLinkProperties);
                 recordMetric(IpManagerEvent.COMPLETE_LIFECYCLE);
                 mStartTimeMillis = 0;
             }
@@ -1518,7 +1612,7 @@ public class IpClient extends StateMachine {
 
     private void startDhcpClient() {
         // Start DHCPv4.
-        mDhcpClient = DhcpClient.makeDhcpClient(mContext, IpClient.this, mInterfaceParams,
+        mDhcpClient = mDependencies.makeDhcpClient(mContext, IpClient.this, mInterfaceParams,
                 mDependencies.getDhcpClientDependencies(mIpMemoryStore));
 
         // If preconnection is enabled, there is no need to ask Wi-Fi to disable powersaving
@@ -1527,7 +1621,7 @@ public class IpClient extends StateMachine {
         // registerForPreDhcpNotification is called later when processing the CMD_*_PRECONNECTION
         // messages.
         if (!isUsingPreconnection()) mDhcpClient.registerForPreDhcpNotification();
-        mDhcpClient.sendMessage(DhcpClient.CMD_START_DHCP, new Configuration(mL2Key,
+        mDhcpClient.sendMessage(DhcpClient.CMD_START_DHCP, new DhcpClient.Configuration(mL2Key,
                 isUsingPreconnection()));
     }
 
@@ -1886,8 +1980,7 @@ public class IpClient extends StateMachine {
                         mDhcpClient.sendMessage(DhcpClient.EVENT_LINKADDRESS_CONFIGURED);
                     } else {
                         logError("Failed to set IPv4 address.");
-                        dispatchCallback(PROV_CHANGE_LOST_PROVISIONING,
-                                new LinkProperties(mLinkProperties));
+                        dispatchCallback(PROV_CHANGE_LOST_PROVISIONING, mLinkProperties);
                         transitionTo(mStoppingState);
                     }
                     break;
@@ -1949,22 +2042,6 @@ public class IpClient extends StateMachine {
         public String toString() {
             return String.format("rcvd_in=%s, proc_in=%s",
                                  receivedInState, processedInState);
-        }
-    }
-
-    private static void setNeighborParameters(
-            INetd netd, String ifName, int numSolicits, int interSolicitIntervalMs)
-            throws RemoteException, IllegalArgumentException {
-        Preconditions.checkNotNull(netd);
-        Preconditions.checkArgument(!TextUtils.isEmpty(ifName));
-        Preconditions.checkArgument(numSolicits > 0);
-        Preconditions.checkArgument(interSolicitIntervalMs > 0);
-
-        for (int family : new Integer[]{INetd.IPV4, INetd.IPV6}) {
-            netd.setProcSysNet(family, INetd.NEIGH, ifName, "retrans_time_ms",
-                    Integer.toString(interSolicitIntervalMs));
-            netd.setProcSysNet(family, INetd.NEIGH, ifName, "ucast_solicit",
-                    Integer.toString(numSolicits));
         }
     }
 

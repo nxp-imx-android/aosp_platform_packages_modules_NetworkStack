@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Copyright (C) 2018 The Android Open Source Project
+<!-- Copyright (C) 2019 The Android Open Source Project
 
      Licensed under the Apache License, Version 2.0 (the "License");
      you may not use this file except in compliance with the License.
@@ -13,17 +13,14 @@
      See the License for the specific language governing permissions and
      limitations under the License.
 -->
-<configuration description="Runs Tests for NetworkStack">
+<configuration description="Runs coverage tests for NetworkStack">
     <target_preparer class="com.android.tradefed.targetprep.TestAppInstallSetup">
-        <option name="test-file-name" value="NetworkStackTests.apk" />
-        <option name="cleanup-apks" value="true" />
+        <option name="test-file-name" value="NetworkStackCoverageTests.apk" />
     </target_preparer>
 
-    <option name="test-suite-tag" value="apct" />
-    <option name="test-suite-tag" value="framework-base-presubmit" />
-    <option name="test-tag" value="NetworkStackTests" />
+    <option name="test-tag" value="NetworkStackCoverageTests" />
     <test class="com.android.tradefed.testtype.AndroidJUnitTest" >
-        <option name="package" value="com.android.server.networkstack.tests" />
+        <option name="package" value="com.android.server.networkstack.coverage" />
         <option name="runner" value="androidx.test.runner.AndroidJUnitRunner" />
         <option name="hidden-api-checks" value="false"/>
     </test>
