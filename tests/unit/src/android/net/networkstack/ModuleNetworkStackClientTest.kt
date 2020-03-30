@@ -21,6 +21,7 @@ import android.net.IIpMemoryStoreCallbacks
 import android.net.INetworkMonitorCallbacks
 import android.net.INetworkStackConnector
 import android.net.Network
+import android.net.NetworkStack
 import android.net.dhcp.DhcpServingParamsParcel
 import android.net.dhcp.IDhcpServerCallbacks
 import android.net.ip.IIpClientCallbacks
@@ -76,11 +77,12 @@ class ModuleNetworkStackClientTest {
     @After
     fun tearDown() {
         ModuleNetworkStackClient.resetInstanceForTest()
+        NetworkStack.setServiceForTest(null)
     }
 
     @Test
     fun testIpClientServiceAvailableImmediately() {
-        doReturn(mConnectorBinder).`when`(mContext).getSystemService(Context.NETWORK_STACK_SERVICE)
+        NetworkStack.setServiceForTest(mConnectorBinder)
         ModuleNetworkStackClient.getInstance(mContext).makeIpClient(TEST_IFNAME, mIpClientCb)
         verify(mConnector).makeIpClient(TEST_IFNAME, mIpClientCb)
     }
@@ -91,14 +93,14 @@ class ModuleNetworkStackClientTest {
 
         Thread.sleep(TEST_TIMEOUT_MS)
         verify(mConnector, never()).makeIpClient(any(), any())
-        doReturn(mConnectorBinder).`when`(mContext).getSystemService(Context.NETWORK_STACK_SERVICE)
+        NetworkStack.setServiceForTest(mConnectorBinder)
         // Use a longer timeout as polling can cause larger delays
         verify(mConnector, timeout(TEST_TIMEOUT_MS * 4)).makeIpClient(TEST_IFNAME, mIpClientCb)
     }
 
     @Test
     fun testDhcpServerAvailableImmediately() {
-        doReturn(mConnectorBinder).`when`(mContext).getSystemService(Context.NETWORK_STACK_SERVICE)
+        NetworkStack.setServiceForTest(mConnectorBinder)
         val testParams = DhcpServingParamsParcel()
         ModuleNetworkStackClient.getInstance(mContext).makeDhcpServer(TEST_IFNAME, testParams,
                 mDhcpServerCb)
@@ -107,7 +109,7 @@ class ModuleNetworkStackClientTest {
 
     @Test
     fun testNetworkMonitorAvailableImmediately() {
-        doReturn(mConnectorBinder).`when`(mContext).getSystemService(Context.NETWORK_STACK_SERVICE)
+        NetworkStack.setServiceForTest(mConnectorBinder)
         val testName = "NetworkMonitorName"
         ModuleNetworkStackClient.getInstance(mContext).makeNetworkMonitor(TEST_NETWORK, testName,
                 mNetworkMonitorCb)
@@ -116,7 +118,7 @@ class ModuleNetworkStackClientTest {
 
     @Test
     fun testIpMemoryStoreAvailableImmediately() {
-        doReturn(mConnectorBinder).`when`(mContext).getSystemService(Context.NETWORK_STACK_SERVICE)
+        NetworkStack.setServiceForTest(mConnectorBinder)
         ModuleNetworkStackClient.getInstance(mContext).fetchIpMemoryStore(mIpMemoryStoreCb)
         verify(mConnector).fetchIpMemoryStore(mIpMemoryStoreCb)
     }
