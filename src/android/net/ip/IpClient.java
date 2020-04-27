@@ -74,7 +74,6 @@ import com.android.internal.util.HexDump;
 import com.android.internal.util.IState;
 import com.android.internal.util.IndentingPrintWriter;
 import com.android.internal.util.MessageUtils;
-import com.android.internal.util.Preconditions;
 import com.android.internal.util.State;
 import com.android.internal.util.StateMachine;
 import com.android.internal.util.WakeupMessage;
@@ -549,8 +548,8 @@ public class IpClient extends StateMachine {
             NetworkObserverRegistry observerRegistry, NetworkStackServiceManager nssManager,
             Dependencies deps) {
         super(IpClient.class.getSimpleName() + "." + ifName);
-        Preconditions.checkNotNull(ifName);
-        Preconditions.checkNotNull(callback);
+        Objects.requireNonNull(ifName);
+        Objects.requireNonNull(callback);
 
         mTag = getName();
 
@@ -582,8 +581,10 @@ public class IpClient extends StateMachine {
                 mMinRdnssLifetimeSec);
 
         mLinkObserver = new IpClientLinkObserver(
+                mContext, getHandler(),
                 mInterfaceName,
-                () -> sendMessage(EVENT_NETLINK_LINKPROPERTIES_CHANGED), config) {
+                () -> sendMessage(EVENT_NETLINK_LINKPROPERTIES_CHANGED),
+                config, mLog) {
             @Override
             public void onInterfaceAdded(String iface) {
                 super.onInterfaceAdded(iface);
@@ -793,6 +794,11 @@ public class IpClient extends StateMachine {
                         + " in provisioning configuration", e);
             }
         }
+
+        if (req.mLayer2Info != null) {
+            mL2Key = req.mLayer2Info.mL2Key;
+            mGroupHint = req.mLayer2Info.mGroupHint;
+        }
         sendMessage(CMD_START, new android.net.shared.ProvisioningConfiguration(req));
     }
 
@@ -903,7 +909,7 @@ public class IpClient extends StateMachine {
     }
 
     /**
-     * Update the network bssid, L2Key and GroupHint layer2 information.
+     * Update the network bssid, L2Key and GroupHint on L2 roaming happened.
      */
     public void updateLayer2Information(@NonNull Layer2InformationParcelable info) {
         sendMessage(CMD_UPDATE_L2INFORMATION, info);
@@ -1225,6 +1231,7 @@ public class IpClient extends StateMachine {
             newLp.addRoute(route);
         }
         addAllReachableDnsServers(newLp, netlinkLinkProperties.getDnsServers());
+        newLp.setNat64Prefix(netlinkLinkProperties.getNat64Prefix());
 
         // [3] Add in data from DHCPv4, if available.
         //
@@ -1532,10 +1539,10 @@ public class IpClient extends StateMachine {
         mL2Key = info.l2Key;
         mGroupHint = info.groupHint;
 
-        // This means IpClient is still in the StoppedState, WiFi is trying to associate
-        // to the AP, just update L2Key and GroupHint at this stage, because these members
-        // will be used when starting DhcpClient.
-        if (info.bssid == null || mCurrentBssid == null) return;
+        if (info.bssid == null || mCurrentBssid == null) {
+            Log.wtf(mTag, "bssid in the parcelable or current tracked bssid should be non-null");
+            return;
+        }
 
         // If the BSSID has not changed, there is nothing to do.
         if (info.bssid.equals(mCurrentBssid)) return;
@@ -1563,6 +1570,7 @@ public class IpClient extends StateMachine {
         public void enter() {
             stopAllIP();
 
+            mLinkObserver.clearInterfaceParams();
             resetLinkProperties();
             if (mStartTimeMillis > 0) {
                 // Completed a life-cycle; send a final empty LinkProperties
@@ -1609,10 +1617,6 @@ public class IpClient extends StateMachine {
                     mGroupHint = args.second;
                     break;
                 }
-
-                case CMD_UPDATE_L2INFORMATION:
-                    handleUpdateL2Information((Layer2InformationParcelable) msg.obj);
-                    break;
 
                 case CMD_SET_MULTICAST_FILTER:
                     mMulticastFiltering = (boolean) msg.obj;
@@ -1694,6 +1698,18 @@ public class IpClient extends StateMachine {
     class ClearingIpAddressesState extends State {
         @Override
         public void enter() {
+            // Ensure that interface parameters are fetched on the handler thread so they are
+            // properly ordered with other events, such as restoring the interface MTU on teardown.
+            mInterfaceParams = mDependencies.getInterfaceParams(mInterfaceName);
+            if (mInterfaceParams == null) {
+                logError("Failed to find InterfaceParams for " + mInterfaceName);
+                doImmediateProvisioningFailure(IpManagerEvent.ERROR_INTERFACE_NOT_FOUND);
+                deferMessage(obtainMessage(CMD_STOP));
+                return;
+            }
+
+            mLinkObserver.setInterfaceParams(mInterfaceParams);
+
             if (readyToProceed()) {
                 deferMessage(obtainMessage(CMD_ADDRESSES_CLEARED));
             } else {
@@ -1703,15 +1719,6 @@ public class IpClient extends StateMachine {
                 stopAllIP();
             }
 
-            // Ensure that interface parameters are fetched on the handler thread so they are
-            // properly ordered with other events, such as restoring the interface MTU on teardown.
-            mInterfaceParams = mDependencies.getInterfaceParams(mInterfaceName);
-            if (mInterfaceParams == null) {
-                logError("Failed to find InterfaceParams for " + mInterfaceName);
-                doImmediateProvisioningFailure(IpManagerEvent.ERROR_INTERFACE_NOT_FOUND);
-                transitionTo(mStoppedState);
-                return;
-            }
             mCallback.setNeighborDiscoveryOffload(true);
         }
 
@@ -1746,7 +1753,7 @@ public class IpClient extends StateMachine {
         }
 
         private boolean readyToProceed() {
-            return (!mLinkProperties.hasIpv4Address() && !mLinkProperties.hasGlobalIpv6Address());
+            return !mLinkProperties.hasIpv4Address() && !mLinkProperties.hasGlobalIpv6Address();
         }
     }
 
