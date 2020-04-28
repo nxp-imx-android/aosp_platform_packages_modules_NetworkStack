@@ -24,6 +24,8 @@ import static android.net.ipmemorystore.Status.SUCCESS;
 import static com.android.server.connectivity.ipmemorystore.IpMemoryStoreDatabase.EXPIRY_ERROR;
 import static com.android.server.connectivity.ipmemorystore.RegularMaintenanceJobService.InterruptMaintenance;
 
+import android.annotation.NonNull;
+import android.annotation.Nullable;
 import android.content.Context;
 import android.database.SQLException;
 import android.database.sqlite.SQLiteDatabase;
@@ -41,9 +43,6 @@ import android.net.ipmemorystore.Status;
 import android.net.ipmemorystore.StatusParcelable;
 import android.os.RemoteException;
 import android.util.Log;
-
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 
 import com.android.internal.annotations.VisibleForTesting;
 

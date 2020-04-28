@@ -22,7 +22,7 @@ import java.nio.ByteBuffer;
 /**
  * This class implements the DHCP-NAK packet.
  */
-public class DhcpNakPacket extends DhcpPacket {
+class DhcpNakPacket extends DhcpPacket {
     /**
      * Generates a NAK packet with the specified parameters.
      */

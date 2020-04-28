@@ -16,14 +16,10 @@
 
 package android.net.util;
 
-import android.content.Context;
-import android.content.pm.PackageManager.NameNotFoundException;
+import android.annotation.NonNull;
+import android.annotation.Nullable;
 import android.provider.DeviceConfig;
-import android.util.Log;
 import android.util.SparseArray;
-
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -38,7 +34,8 @@ import java.util.function.Predicate;
  * Collection of utilities for the network stack.
  */
 public class NetworkStackUtils {
-    private static final String TAG = "NetworkStackUtils";
+    // TODO: Refer to DeviceConfig definition.
+    public static final String NAMESPACE_CONNECTIVITY = "connectivity";
 
     /**
      * A list of captive portal detection specifications used in addition to the fallback URLs.
@@ -116,11 +113,6 @@ public class NetworkStackUtils {
      */
     public static final String DHCP_INIT_REBOOT_ENABLED = "dhcp_init_reboot_enabled";
 
-    /**
-     * Experiment flag to enable DHCP Rapid Commit option, default value is false.
-     */
-    public static final String DHCP_RAPID_COMMIT_ENABLED = "dhcp_rapid_commit_enabled";
-
     static {
         System.loadLibrary("networkstackutilsjni");
     }
@@ -195,7 +187,8 @@ public class NetworkStackUtils {
      * Look up the value of a property for a particular namespace from {@link DeviceConfig}.
      * @param namespace The namespace containing the property to look up.
      * @param name The name of the property to look up.
-     * @param defaultValue The value to return if the property does not exist or its value is null.
+     * @param defaultValue The value to return if the property does not exist or has no non-null
+     *                     value.
      * @return the corresponding value, or defaultValue if none exists.
      */
     public static int getDeviceConfigPropertyInt(@NonNull String namespace, @NonNull String name,
@@ -205,43 +198,6 @@ public class NetworkStackUtils {
             return (value != null) ? Integer.parseInt(value) : defaultValue;
         } catch (NumberFormatException e) {
             return defaultValue;
-        }
-    }
-
-    /**
-     * Look up the value of a property for a particular namespace from {@link DeviceConfig}.
-     * @param namespace The namespace containing the property to look up.
-     * @param name The name of the property to look up.
-     * @param defaultValue The value to return if the property does not exist or its value is null.
-     * @return the corresponding value, or defaultValue if none exists.
-     */
-    public static boolean getDeviceConfigPropertyBoolean(@NonNull String namespace,
-            @NonNull String name, boolean defaultValue) {
-        String value = getDeviceConfigProperty(namespace, name, null /* defaultValue */);
-        return (value != null) ? Boolean.parseBoolean(value) : defaultValue;
-    }
-
-    /**
-     * Check whether or not one specific experimental feature for a particular namespace from
-     * {@link DeviceConfig} is enabled by comparing NetworkStack module version {@link NetworkStack}
-     * with current version of property. If this property version is valid, the corresponding
-     * experimental feature would be enabled, otherwise disabled.
-     * @param context The global context information about an app environment.
-     * @param namespace The namespace containing the property to look up.
-     * @param name The name of the property to look up.
-     * @return true if this feature is enabled, or false if disabled.
-     */
-    public static boolean isFeatureEnabled(@NonNull Context context, @NonNull String namespace,
-            @NonNull String name) {
-        try {
-            final int propertyVersion = getDeviceConfigPropertyInt(namespace, name,
-                    0 /* default value */);
-            final long packageVersion = context.getPackageManager().getPackageInfo(
-                    context.getPackageName(), 0).getLongVersionCode();
-            return (propertyVersion != 0 && packageVersion >= (long) propertyVersion);
-        } catch (NameNotFoundException e) {
-            Log.e(TAG, "Could not find the package name", e);
-            return false;
         }
     }
 

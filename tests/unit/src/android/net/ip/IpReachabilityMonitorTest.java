@@ -62,8 +62,6 @@ public class IpReachabilityMonitorTest {
 
     @Test
     public void testNothing() {
-        // make sure the unit test runs in the same thread with main looper.
-        // Otherwise, throwing IllegalStateException would cause test fails.
-        mHandler.post(() -> makeMonitor());
+        IpReachabilityMonitor monitor = makeMonitor();
     }
 }

@@ -22,7 +22,7 @@ import java.nio.ByteBuffer;
 /**
  * This class implements the DHCP-OFFER packet.
  */
-public class DhcpOfferPacket extends DhcpPacket {
+class DhcpOfferPacket extends DhcpPacket {
     /**
      * The IP address of the server which sent this packet.
      */

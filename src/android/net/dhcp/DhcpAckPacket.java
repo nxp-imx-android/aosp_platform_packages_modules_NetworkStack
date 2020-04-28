@@ -22,7 +22,7 @@ import java.nio.ByteBuffer;
 /**
  * This class implements the DHCP-ACK packet.
  */
-public class DhcpAckPacket extends DhcpPacket {
+class DhcpAckPacket extends DhcpPacket {
 
     /**
      * The address of the server which sent this packet.

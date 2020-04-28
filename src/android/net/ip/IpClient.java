@@ -18,10 +18,10 @@ package android.net.ip;
 
 import static android.net.RouteInfo.RTN_UNICAST;
 import static android.net.shared.IpConfigurationParcelableUtil.toStableParcelable;
-import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 
-import static com.android.server.util.PermissionUtil.enforceNetworkStackCallingPermission;
+import static com.android.server.util.PermissionUtil.checkNetworkStackCallingPermission;
 
+import android.annotation.NonNull;
 import android.content.Context;
 import android.net.ConnectivityManager;
 import android.net.DhcpResults;
@@ -43,22 +43,17 @@ import android.net.metrics.IpManagerEvent;
 import android.net.shared.InitialConfiguration;
 import android.net.shared.ProvisioningConfiguration;
 import android.net.util.InterfaceParams;
-import android.net.util.NetworkStackUtils;
 import android.net.util.SharedLog;
-import android.os.Build;
 import android.os.ConditionVariable;
 import android.os.IBinder;
 import android.os.Message;
 import android.os.RemoteException;
-import android.os.ServiceSpecificException;
 import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.LocalLog;
 import android.util.Log;
 import android.util.Pair;
 import android.util.SparseArray;
-
-import androidx.annotation.NonNull;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.util.IState;
@@ -68,7 +63,6 @@ import com.android.internal.util.Preconditions;
 import com.android.internal.util.State;
 import com.android.internal.util.StateMachine;
 import com.android.internal.util.WakeupMessage;
-import com.android.networkstack.apishim.ShimUtils;
 import com.android.server.NetworkObserverRegistry;
 import com.android.server.NetworkStackService.NetworkStackServiceManager;
 
@@ -317,14 +311,8 @@ public class IpClient extends StateMachine {
     // IpClient shares a handler with DhcpClient: commands must not overlap
     public static final int DHCPCLIENT_CMD_BASE = 1000;
 
-    // Settings and default values.
     private static final int MAX_LOG_RECORDS = 500;
     private static final int MAX_PACKET_RECORDS = 100;
-
-    @VisibleForTesting
-    static final String CONFIG_MIN_RDNSS_LIFETIME = "ipclient_min_rdnss_lifetime";
-    private static final int DEFAULT_MIN_RDNSS_LIFETIME =
-            ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q) ? 120 : 0;
 
     private static final boolean NO_CALLBACKS = false;
     private static final boolean SEND_CALLBACKS = true;
@@ -364,9 +352,6 @@ public class IpClient extends StateMachine {
     private final MessageHandlingLogger mMsgStateLogger;
     private final IpConnectivityLog mMetricsLog = new IpConnectivityLog();
     private final InterfaceController mInterfaceCtrl;
-
-    // Ignore nonzero RDNSS option lifetimes below this value. 0 = disabled.
-    private final int mMinRdnssLifetimeSec;
 
     private InterfaceParams mInterfaceParams;
 
@@ -416,22 +401,6 @@ public class IpClient extends StateMachine {
                 NetworkStackServiceManager nssManager) {
             return new NetworkStackIpMemoryStore(context, nssManager.getIpMemoryStoreService());
         }
-
-        /**
-         * Get a DhcpClient Dependencies instance.
-         */
-        public DhcpClient.Dependencies getDhcpClientDependencies(
-                NetworkStackIpMemoryStore ipMemoryStore) {
-            return new DhcpClient.Dependencies(ipMemoryStore);
-        }
-
-        /**
-         * Read an integer DeviceConfig property.
-         */
-        public int getDeviceConfigPropertyInt(String name, int defaultValue) {
-            return NetworkStackUtils.getDeviceConfigPropertyInt(NAMESPACE_CONNECTIVITY, name,
-                    defaultValue);
-        }
     }
 
     public IpClient(Context context, String ifName, IIpClientCallbacks callback,
@@ -470,15 +439,9 @@ public class IpClient extends StateMachine {
         mNetd = deps.getNetd(mContext);
         mInterfaceCtrl = new InterfaceController(mInterfaceName, mNetd, mLog);
 
-        mMinRdnssLifetimeSec = mDependencies.getDeviceConfigPropertyInt(
-                CONFIG_MIN_RDNSS_LIFETIME, DEFAULT_MIN_RDNSS_LIFETIME);
-
-        IpClientLinkObserver.Configuration config = new IpClientLinkObserver.Configuration(
-                mMinRdnssLifetimeSec);
-
         mLinkObserver = new IpClientLinkObserver(
                 mInterfaceName,
-                () -> sendMessage(EVENT_NETLINK_LINKPROPERTIES_CHANGED), config) {
+                () -> sendMessage(EVENT_NETLINK_LINKPROPERTIES_CHANGED)) {
             @Override
             public void onInterfaceAdded(String iface) {
                 super.onInterfaceAdded(iface);
@@ -543,67 +506,67 @@ public class IpClient extends StateMachine {
     class IpClientConnector extends IIpClient.Stub {
         @Override
         public void completedPreDhcpAction() {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.completedPreDhcpAction();
         }
         @Override
         public void confirmConfiguration() {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.confirmConfiguration();
         }
         @Override
         public void readPacketFilterComplete(byte[] data) {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.readPacketFilterComplete(data);
         }
         @Override
         public void shutdown() {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.shutdown();
         }
         @Override
         public void startProvisioning(ProvisioningConfigurationParcelable req) {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.startProvisioning(ProvisioningConfiguration.fromStableParcelable(req));
         }
         @Override
         public void stop() {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.stop();
         }
         @Override
         public void setL2KeyAndGroupHint(String l2Key, String groupHint) {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.setL2KeyAndGroupHint(l2Key, groupHint);
         }
         @Override
         public void setTcpBufferSizes(String tcpBufferSizes) {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.setTcpBufferSizes(tcpBufferSizes);
         }
         @Override
         public void setHttpProxy(ProxyInfo proxyInfo) {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.setHttpProxy(proxyInfo);
         }
         @Override
         public void setMulticastFilter(boolean enabled) {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.setMulticastFilter(enabled);
         }
         @Override
         public void addKeepalivePacketFilter(int slot, TcpKeepalivePacketDataParcelable pkt) {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.addKeepalivePacketFilter(slot, pkt);
         }
         @Override
         public void addNattKeepalivePacketFilter(int slot, NattKeepalivePacketDataParcelable pkt) {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.addNattKeepalivePacketFilter(slot, pkt);
         }
         @Override
         public void removeKeepalivePacketFilter(int slot) {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
             IpClient.this.removeKeepalivePacketFilter(slot);
         }
 
@@ -879,12 +842,10 @@ public class IpClient extends StateMachine {
         return shouldLog;
     }
 
-    private void logError(String fmt, Throwable e, Object... args) {
-        mLog.e(String.format(fmt, args), e);
-    }
-
     private void logError(String fmt, Object... args) {
-        logError(fmt, null, args);
+        final String msg = "ERROR " + String.format(fmt, args);
+        Log.e(mTag, msg);
+        mLog.log(msg);
     }
 
     // This needs to be called with care to ensure that our LinkProperties
@@ -1229,7 +1190,7 @@ public class IpClient extends StateMachine {
         } else {
             // Start DHCPv4.
             mDhcpClient = DhcpClient.makeDhcpClient(mContext, IpClient.this, mInterfaceParams,
-                    mDependencies.getDhcpClientDependencies(mIpMemoryStore));
+                    mIpMemoryStore);
             mDhcpClient.registerForPreDhcpNotification();
             mDhcpClient.sendMessage(DhcpClient.CMD_START_DHCP, mL2Key);
         }
@@ -1303,28 +1264,6 @@ public class IpClient extends StateMachine {
 
     private void maybeSaveNetworkToIpMemoryStore() {
         // TODO : implement this
-    }
-
-    private void maybeRestoreInterfaceMtu() {
-        InterfaceParams params = mDependencies.getInterfaceParams(mInterfaceName);
-        if (params == null) {
-            Log.w(mTag, "interface: " + mInterfaceName + " is gone");
-            return;
-        }
-
-        if (params.index != mInterfaceParams.index) {
-            Log.w(mTag, "interface: " + mInterfaceName + " has a different index: " + params.index);
-            return;
-        }
-
-        if (params.defaultMtu == mInterfaceParams.defaultMtu) return;
-
-        try {
-            mNetd.interfaceSetMtu(mInterfaceName, mInterfaceParams.defaultMtu);
-        } catch (RemoteException | ServiceSpecificException e) {
-            logError("Couldn't reset MTU on " + mInterfaceName + " from "
-                    + params.defaultMtu + " to " + mInterfaceParams.defaultMtu, e);
-        }
     }
 
     class StoppedState extends State {
@@ -1404,9 +1343,6 @@ public class IpClient extends StateMachine {
                 // There's no DHCPv4 for which to wait; proceed to stopped.
                 deferMessage(obtainMessage(CMD_JUMP_STOPPING_TO_STOPPED));
             }
-
-            // Restore the interface MTU to initial value if it has changed.
-            maybeRestoreInterfaceMtu();
         }
 
         @Override
@@ -1527,7 +1463,6 @@ public class IpClient extends StateMachine {
             // Get the Configuration for ApfFilter from Context
             apfConfig.ieee802_3Filter = ApfCapabilities.getApfDrop8023Frames();
             apfConfig.ethTypeBlackList = ApfCapabilities.getApfEtherTypeBlackList();
-            apfConfig.minRdnssLifetimeSec = mMinRdnssLifetimeSec;
             mApfFilter = ApfFilter.maybeCreate(mContext, apfConfig, mInterfaceParams, mCallback);
             // TODO: investigate the effects of any multicast filtering racing/interfering with the
             // rest of this IP configuration startup.

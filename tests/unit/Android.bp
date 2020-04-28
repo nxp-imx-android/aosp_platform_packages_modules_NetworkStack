@@ -14,16 +14,16 @@
 // limitations under the License.
 //
 
-java_defaults {
-    name: "NetworkStackTestsDefaults",
+android_test {
+    name: "NetworkStackTests",
     certificate: "platform",
-    srcs: ["src/**/*.java", "src/**/*.kt"],
+    srcs: ["src/**/*.java"],
+    test_suites: ["device-tests"],
     resource_dirs: ["res"],
     static_libs: [
         "androidx.test.rules",
-        "kotlin-reflect",
         "mockito-target-extended-minus-junit4",
-        "net-tests-utils",
+        "NetworkStackBase",
         "testables",
     ],
     libs: [
@@ -31,36 +31,11 @@ java_defaults {
         "android.test.base",
         "android.test.mock",
     ],
-    defaults: ["libnetworkstackutilsjni_deps"],
     jni_libs: [
         // For mockito extended
         "libdexmakerjvmtiagent",
         "libstaticjvmtiagent",
-        "libnetworkstackutilsjni",
-    ],
-}
-
-android_test {
-    name: "NetworkStackNextTests",
-    srcs: [], // TODO: tests that only apply to the current, non-stable API can be added here
-    test_suites: ["device-tests"],
-    defaults: ["NetworkStackTestsDefaults"],
-    static_libs: ["NetworkStackApiCurrentLib"],
-}
-
-android_test {
-    name: "NetworkStackTests",
-    test_suites: ["device-tests"],
-    defaults: ["NetworkStackTestsDefaults"],
-    static_libs: ["NetworkStackApiStableLib"],
-}
-
-// Additional dependencies of libnetworkstackutilsjni that are not provided by the system when
-// running as a test application.
-// Using java_defaults as jni_libs does not support filegroups.
-java_defaults {
-    name: "libnetworkstackutilsjni_deps",
-    jni_libs: [
+        // For ApfTest
         "libartbase",
         "libbacktrace",
         "libbase",
@@ -70,16 +45,20 @@ java_defaults {
         "libcgrouprc",
         "libcrypto",
         "libcutils",
+        "libdexfile",
         "ld-android",
         "libdl_android",
         "libhidl-gen-utils",
         "libhidlbase",
+        "libhidltransport",
+        "libhwbinder",
         "libjsoncpp",
         "liblog",
         "liblzma",
         "libnativehelper",
         "libnativehelper_compat_libc++",
         "libnetworkstacktestsjni",
+        "libnetworkstackutilsjni",
         "libpackagelistparser",
         "libpcre2",
         "libprocessgroup",
@@ -93,6 +72,32 @@ java_defaults {
         "libutilscallstack",
         "libziparchive",
         "libz",
-        "netd_aidl_interface-cpp",
+        "netd_aidl_interface-V2-cpp",
+    ],
+}
+
+cc_library_shared {
+    name: "libnetworkstacktestsjni",
+    srcs: [
+        "jni/**/*.cpp"
+    ],
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    include_dirs: [
+        "hardware/google/apf",
+    ],
+    shared_libs: [
+        "libbinder",
+        "liblog",
+        "libcutils",
+        "libnativehelper",
+        "netd_aidl_interface-V2-cpp",
+    ],
+    static_libs: [
+        "libapf",
+        "libpcap",
     ],
 }

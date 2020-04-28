@@ -16,13 +16,15 @@
 
 package android.net.dhcp;
 
+import android.util.Log;
+
 import java.net.Inet4Address;
 import java.nio.ByteBuffer;
 
 /**
  * This class implements the DHCP-REQUEST packet.
  */
-public class DhcpRequestPacket extends DhcpPacket {
+class DhcpRequestPacket extends DhcpPacket {
     /**
      * Generates a REQUEST packet with the specified parameters.
      */

@@ -22,7 +22,7 @@ import java.nio.ByteBuffer;
 /**
  * This class implements the DHCP-DECLINE packet.
  */
-public class DhcpDeclinePacket extends DhcpPacket {
+class DhcpDeclinePacket extends DhcpPacket {
     /**
      * Generates a DECLINE packet with the specified parameters.
      */

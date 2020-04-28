@@ -20,6 +20,8 @@ import static android.net.dhcp.DhcpPacket.DHCP_CLIENT;
 import static android.net.dhcp.DhcpPacket.DHCP_HOST_NAME;
 import static android.net.dhcp.DhcpPacket.DHCP_SERVER;
 import static android.net.dhcp.DhcpPacket.ENCAP_BOOTP;
+import static android.net.dhcp.IDhcpServer.STATUS_INVALID_ARGUMENT;
+import static android.net.dhcp.IDhcpServer.STATUS_SUCCESS;
 import static android.net.shared.Inet4AddressUtils.getBroadcastAddress;
 import static android.net.shared.Inet4AddressUtils.getPrefixMaskAsInet4Address;
 import static android.system.OsConstants.AF_INET;
@@ -34,10 +36,12 @@ import static com.android.internal.util.TrafficStatsConstants.TAG_SYSTEM_DHCP_SE
 import static com.android.server.util.NetworkStackConstants.INFINITE_LEASE;
 import static com.android.server.util.NetworkStackConstants.IPV4_ADDR_ALL;
 import static com.android.server.util.NetworkStackConstants.IPV4_ADDR_ANY;
-import static com.android.server.util.PermissionUtil.enforceNetworkStackCallingPermission;
+import static com.android.server.util.PermissionUtil.checkNetworkStackCallingPermission;
 
 import static java.lang.Integer.toUnsignedLong;
 
+import android.annotation.NonNull;
+import android.annotation.Nullable;
 import android.net.INetworkStackStatusCallback;
 import android.net.MacAddress;
 import android.net.TrafficStats;
@@ -55,10 +59,7 @@ import android.system.Os;
 import android.text.TextUtils;
 import android.util.Pair;
 
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
-import androidx.annotation.VisibleForTesting;
-
+import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.util.HexDump;
 
 import java.io.FileDescriptor;
@@ -212,7 +213,7 @@ public class DhcpServer extends IDhcpServer.Stub {
 
         @Override
         public void checkCaller() {
-            enforceNetworkStackCallingPermission();
+            checkNetworkStackCallingPermission();
         }
     }
 

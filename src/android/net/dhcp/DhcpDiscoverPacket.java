@@ -22,7 +22,7 @@ import java.nio.ByteBuffer;
 /**
  * This class implements the DHCP-DISCOVER packet.
  */
-public class DhcpDiscoverPacket extends DhcpPacket {
+class DhcpDiscoverPacket extends DhcpPacket {
     /**
      * The IP address of the client which sent this packet.
      */
@@ -62,9 +62,6 @@ public class DhcpDiscoverPacket extends DhcpPacket {
         addTlv(buffer, DHCP_CLIENT_IDENTIFIER, getClientId());
         addCommonClientTlvs(buffer);
         addTlv(buffer, DHCP_PARAMETER_LIST, mRequestedParams);
-        if (mRapidCommit) {
-            addTlv(buffer, DHCP_RAPID_COMMIT);
-        }
         addTlvEnd(buffer);
     }
 }

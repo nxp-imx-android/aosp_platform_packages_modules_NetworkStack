@@ -22,7 +22,7 @@ import java.nio.ByteBuffer;
 /**
  * This class implements the (unused) DHCP-INFORM packet.
  */
-public class DhcpInformPacket extends DhcpPacket {
+class DhcpInformPacket extends DhcpPacket {
     /**
      * Generates an INFORM packet with the specified parameters.
      */

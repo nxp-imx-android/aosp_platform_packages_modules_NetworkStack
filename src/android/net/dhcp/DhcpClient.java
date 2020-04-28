@@ -31,13 +31,11 @@ import static android.net.dhcp.DhcpPacket.INADDR_BROADCAST;
 import static android.net.dhcp.DhcpPacket.INFINITE_LEASE;
 import static android.net.util.NetworkStackUtils.closeSocketQuietly;
 import static android.net.util.SocketUtils.makePacketSocketAddress;
-import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 import static android.system.OsConstants.AF_INET;
 import static android.system.OsConstants.AF_PACKET;
 import static android.system.OsConstants.ETH_P_IP;
 import static android.system.OsConstants.IPPROTO_UDP;
 import static android.system.OsConstants.SOCK_DGRAM;
-import static android.system.OsConstants.SOCK_NONBLOCK;
 import static android.system.OsConstants.SOCK_RAW;
 import static android.system.OsConstants.SOL_SOCKET;
 import static android.system.OsConstants.SO_BROADCAST;
@@ -46,6 +44,7 @@ import static android.system.OsConstants.SO_REUSEADDR;
 
 import static com.android.server.util.NetworkStackConstants.IPV4_ADDR_ANY;
 
+import android.annotation.NonNull;
 import android.content.Context;
 import android.net.DhcpResults;
 import android.net.InetAddresses;
@@ -60,9 +59,7 @@ import android.net.metrics.DhcpErrorEvent;
 import android.net.metrics.IpConnectivityLog;
 import android.net.util.InterfaceParams;
 import android.net.util.NetworkStackUtils;
-import android.net.util.PacketReader;
 import android.net.util.SocketUtils;
-import android.os.Handler;
 import android.os.Message;
 import android.os.SystemClock;
 import android.system.ErrnoException;
@@ -70,9 +67,6 @@ import android.system.Os;
 import android.util.EventLog;
 import android.util.Log;
 import android.util.SparseArray;
-
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.util.HexDump;
@@ -185,8 +179,7 @@ public class DhcpClient extends StateMachine {
     private static final int EVENT_CONFIGURATION_INVALID   = PRIVATE_BASE + 9;
 
     // constant to represent this DHCP lease has been expired.
-    @VisibleForTesting
-    public static final long EXPIRED_LEASE = 1L;
+    private static final long EXPIRED_LEASE = 1L;
 
     // For message logging.
     private static final Class[] sMessageClasses = { DhcpClient.class };
@@ -215,9 +208,14 @@ public class DhcpClient extends StateMachine {
     private final Random mRandom;
     private final IpConnectivityLog mMetricsLog = new IpConnectivityLog();
 
-    // We use a UDP socket to send, so the kernel handles ARP and routing for us (DHCP servers can
-    // be off-link as well as on-link).
+    // Sockets.
+    // - We use a packet socket to receive, because servers send us packets bound for IP addresses
+    //   which we have not yet configured, and the kernel protocol stack drops these.
+    // - We use a UDP socket to send, so the kernel handles ARP and routing for us (DHCP servers can
+    //   be off-link as well as on-link).
+    private FileDescriptor mPacketSock;
     private FileDescriptor mUdpSock;
+    private ReceiveThread mReceiveThread;
 
     // State variables.
     private final StateMachine mController;
@@ -241,11 +239,9 @@ public class DhcpClient extends StateMachine {
     private String mL2Key;
     private Inet4Address mLastAssignedIpv4Address;
     private long mLastAssignedIpv4AddressExpiry;
-    private Dependencies mDependencies;
+    private boolean mDhcpLeaseCacheEnabled;
     @NonNull
     private final NetworkStackIpMemoryStore mIpMemoryStore;
-    @Nullable
-    private DhcpPacketHandler mDhcpPacketHandler;
 
     // Milliseconds SystemClock timestamps used to record transition times to DhcpBoundState.
     private long mLastInitEnterTime;
@@ -275,43 +271,15 @@ public class DhcpClient extends StateMachine {
         return new WakeupMessage(mContext, getHandler(), cmdName, cmd);
     }
 
-    /**
-     * Encapsulates DhcpClient depencencies that's used for unit testing and
-     * integration testing.
-     */
-    public static class Dependencies {
-        private final NetworkStackIpMemoryStore mNetworkStackIpMemoryStore;
-
-        public Dependencies(NetworkStackIpMemoryStore store) {
-            mNetworkStackIpMemoryStore = store;
-        }
-
-        /**
-         * Get a IpMemoryStore instance.
-         */
-        public NetworkStackIpMemoryStore getIpMemoryStore() {
-            return mNetworkStackIpMemoryStore;
-        }
-
-        /**
-         * Get the value of DHCP related experiment flags.
-         */
-        public boolean getBooleanDeviceConfig(final String nameSpace, final String flagName) {
-            return NetworkStackUtils.getDeviceConfigPropertyBoolean(nameSpace, flagName,
-                    false /* default value */);
-        }
-    }
-
     // TODO: Take an InterfaceParams instance instead of an interface name String.
     private DhcpClient(Context context, StateMachine controller, String iface,
-            Dependencies deps) {
+            NetworkStackIpMemoryStore ipMemoryStore) {
         super(TAG, controller.getHandler());
 
-        mDependencies = deps;
         mContext = context;
         mController = controller;
         mIfaceName = iface;
-        mIpMemoryStore = deps.getIpMemoryStore();
+        mIpMemoryStore = ipMemoryStore;
 
         // CHECKSTYLE:OFF IndentationCheck
         addState(mStoppedState);
@@ -352,8 +320,8 @@ public class DhcpClient extends StateMachine {
 
     public static DhcpClient makeDhcpClient(
             Context context, StateMachine controller, InterfaceParams ifParams,
-            Dependencies deps) {
-        DhcpClient client = new DhcpClient(context, controller, ifParams.name, deps);
+            NetworkStackIpMemoryStore ipMemoryStore) {
+        DhcpClient client = new DhcpClient(context, controller, ifParams.name, ipMemoryStore);
         client.mIface = ifParams;
         client.start();
         return client;
@@ -364,21 +332,19 @@ public class DhcpClient extends StateMachine {
      *
      */
     public boolean isDhcpLeaseCacheEnabled() {
-        return mDependencies.getBooleanDeviceConfig(NAMESPACE_CONNECTIVITY,
-                NetworkStackUtils.DHCP_INIT_REBOOT_ENABLED);
+        mDhcpLeaseCacheEnabled = Boolean.parseBoolean(NetworkStackUtils.getDeviceConfigProperty(
+                NetworkStackUtils.NAMESPACE_CONNECTIVITY,
+                NetworkStackUtils.DHCP_INIT_REBOOT_ENABLED, "false"));
+        return mDhcpLeaseCacheEnabled;
     }
 
     /**
-     * check whether or not to support DHCP Rapid Commit option.
+     * set DHCP lease cached enabled experiment flag.
+     *
      */
-    public boolean isDhcpRapidCommitEnabled() {
-        return mDependencies.getBooleanDeviceConfig(NAMESPACE_CONNECTIVITY,
-                NetworkStackUtils.DHCP_RAPID_COMMIT_ENABLED);
-    }
-
-    private void confirmDhcpLease(DhcpPacket packet, DhcpResults results) {
-        setDhcpLeaseExpiry(packet);
-        acceptDhcpResults(results, "Confirmed");
+    @VisibleForTesting
+    public void setDhcpLeaseCacheEnabled(final boolean enabled) {
+        mDhcpLeaseCacheEnabled = enabled;
     }
 
     private boolean initInterface() {
@@ -398,6 +364,23 @@ public class DhcpClient extends StateMachine {
         mTransactionStartMillis = SystemClock.elapsedRealtime();
     }
 
+    private boolean initSockets() {
+        return initPacketSocket() && initUdpSocket();
+    }
+
+    private boolean initPacketSocket() {
+        try {
+            mPacketSock = Os.socket(AF_PACKET, SOCK_RAW, ETH_P_IP);
+            SocketAddress addr = makePacketSocketAddress((short) ETH_P_IP, mIface.index);
+            Os.bind(mPacketSock, addr);
+            NetworkStackUtils.attachDhcpFilter(mPacketSock);
+        } catch(SocketException|ErrnoException e) {
+            Log.e(TAG, "Error creating packet socket", e);
+            return false;
+        }
+        return true;
+    }
+
     private boolean initUdpSocket() {
         final int oldTag = TrafficStats.getAndSetThreadStatsTag(
                 TrafficStatsConstants.TAG_SYSTEM_DHCP);
@@ -408,7 +391,7 @@ public class DhcpClient extends StateMachine {
             Os.setsockoptInt(mUdpSock, SOL_SOCKET, SO_BROADCAST, 1);
             Os.setsockoptInt(mUdpSock, SOL_SOCKET, SO_RCVBUF, 0);
             Os.bind(mUdpSock, IPV4_ADDR_ANY, DhcpPacket.DHCP_CLIENT);
-        } catch (SocketException | ErrnoException e) {
+        } catch(SocketException|ErrnoException e) {
             Log.e(TAG, "Error creating UDP socket", e);
             return false;
         } finally {
@@ -421,76 +404,59 @@ public class DhcpClient extends StateMachine {
         try {
             Os.connect(mUdpSock, to, DhcpPacket.DHCP_SERVER);
             return true;
-        } catch (SocketException | ErrnoException e) {
+        } catch (SocketException|ErrnoException e) {
             Log.e(TAG, "Error connecting UDP socket", e);
             return false;
         }
     }
 
-    private class DhcpPacketHandler extends PacketReader {
-        private FileDescriptor mPacketSock;
+    private void closeSockets() {
+        closeSocketQuietly(mUdpSock);
+        closeSocketQuietly(mPacketSock);
+    }
 
-        DhcpPacketHandler(Handler handler) {
-            super(handler);
+    class ReceiveThread extends Thread {
+
+        private final byte[] mPacket = new byte[DhcpPacket.MAX_LENGTH];
+        private volatile boolean mStopped = false;
+
+        public void halt() {
+            mStopped = true;
+            closeSockets();  // Interrupts the read() call the thread is blocked in.
         }
 
         @Override
-        protected void handlePacket(byte[] recvbuf, int length) {
-            try {
-                final DhcpPacket packet = DhcpPacket.decodeFullPacket(recvbuf, length,
-                        DhcpPacket.ENCAP_L2);
-                if (DBG) Log.d(TAG, "Received packet: " + packet);
-                sendMessage(CMD_RECEIVED_PACKET, packet);
-            } catch (DhcpPacket.ParseException e) {
-                Log.e(TAG, "Can't parse packet: " + e.getMessage());
-                if (PACKET_DBG) {
-                    Log.d(TAG, HexDump.dumpHexString(recvbuf, 0, length));
+        public void run() {
+            if (DBG) Log.d(TAG, "Receive thread started");
+            while (!mStopped) {
+                int length = 0;  // Or compiler can't tell it's initialized if a parse error occurs.
+                try {
+                    length = Os.read(mPacketSock, mPacket, 0, mPacket.length);
+                    DhcpPacket packet = null;
+                    packet = DhcpPacket.decodeFullPacket(mPacket, length, DhcpPacket.ENCAP_L2);
+                    if (DBG) Log.d(TAG, "Received packet: " + packet);
+                    sendMessage(CMD_RECEIVED_PACKET, packet);
+                } catch (IOException|ErrnoException e) {
+                    if (!mStopped) {
+                        Log.e(TAG, "Read error", e);
+                        logError(DhcpErrorEvent.RECEIVE_ERROR);
+                    }
+                } catch (DhcpPacket.ParseException e) {
+                    Log.e(TAG, "Can't parse packet: " + e.getMessage());
+                    if (PACKET_DBG) {
+                        Log.d(TAG, HexDump.dumpHexString(mPacket, 0, length));
+                    }
+                    if (e.errorCode == DhcpErrorEvent.DHCP_NO_COOKIE) {
+                        int snetTagId = 0x534e4554;
+                        String bugId = "31850211";
+                        int uid = -1;
+                        String data = DhcpPacket.ParseException.class.getName();
+                        EventLog.writeEvent(snetTagId, bugId, uid, data);
+                    }
+                    logError(e.errorCode);
                 }
-                if (e.errorCode == DhcpErrorEvent.DHCP_NO_COOKIE) {
-                    final int snetTagId = 0x534e4554;
-                    final String bugId = "31850211";
-                    final int uid = -1;
-                    final String data = DhcpPacket.ParseException.class.getName();
-                    EventLog.writeEvent(snetTagId, bugId, uid, data);
-                }
-                mMetricsLog.log(mIfaceName, new DhcpErrorEvent(e.errorCode));
             }
-        }
-
-        @Override
-        protected FileDescriptor createFd() {
-            try {
-                mPacketSock = Os.socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, 0 /* protocol */);
-                NetworkStackUtils.attachDhcpFilter(mPacketSock);
-                final SocketAddress addr = makePacketSocketAddress(ETH_P_IP, mIface.index);
-                Os.bind(mPacketSock, addr);
-            } catch (SocketException | ErrnoException e) {
-                logError("Error creating packet socket", e);
-                closeFd(mPacketSock);
-                mPacketSock = null;
-                return null;
-            }
-            return mPacketSock;
-        }
-
-        @Override
-        protected int readPacket(FileDescriptor fd, byte[] packetBuffer) throws Exception {
-            try {
-                return Os.read(fd, packetBuffer, 0, packetBuffer.length);
-            } catch (IOException | ErrnoException e) {
-                mMetricsLog.log(mIfaceName, new DhcpErrorEvent(DhcpErrorEvent.RECEIVE_ERROR));
-                throw e;
-            }
-        }
-
-        @Override
-        protected void logError(@NonNull String msg, @Nullable Exception e) {
-            Log.e(TAG, msg, e);
-        }
-
-        public int transmitPacket(final ByteBuffer buf, final SocketAddress socketAddress)
-                throws ErrnoException, SocketException {
-            return Os.sendto(mPacketSock, buf.array(), 0, buf.limit(), 0, socketAddress);
+            if (DBG) Log.d(TAG, "Receive thread stopped");
         }
     }
 
@@ -502,7 +468,7 @@ public class DhcpClient extends StateMachine {
         try {
             if (encap == DhcpPacket.ENCAP_L2) {
                 if (DBG) Log.d(TAG, "Broadcasting " + description);
-                mDhcpPacketHandler.transmitPacket(buf, mInterfaceBroadcastAddr);
+                Os.sendto(mPacketSock, buf.array(), 0, buf.limit(), 0, mInterfaceBroadcastAddr);
             } else if (encap == DhcpPacket.ENCAP_BOOTP && to.equals(INADDR_BROADCAST)) {
                 if (DBG) Log.d(TAG, "Broadcasting " + description);
                 // We only send L3-encapped broadcasts in DhcpRebindingState,
@@ -519,7 +485,7 @@ public class DhcpClient extends StateMachine {
                         description, Os.getpeername(mUdpSock)));
                 Os.write(mUdpSock, buf);
             }
-        } catch (ErrnoException | IOException e) {
+        } catch(ErrnoException|IOException e) {
             Log.e(TAG, "Can't send packet: ", e);
             return false;
         }
@@ -529,7 +495,7 @@ public class DhcpClient extends StateMachine {
     private boolean sendDiscoverPacket() {
         ByteBuffer packet = DhcpPacket.buildDiscoverPacket(
                 DhcpPacket.ENCAP_L2, mTransactionId, getSecs(), mHwAddr,
-                DO_UNICAST, REQUESTED_PARAMS, isDhcpRapidCommitEnabled());
+                DO_UNICAST, REQUESTED_PARAMS);
         return transmitPacket(packet, "DHCPDISCOVER", DhcpPacket.ENCAP_L2, INADDR_BROADCAST);
     }
 
@@ -776,22 +742,21 @@ public class DhcpClient extends StateMachine {
         @Override
         public void enter() {
             clearDhcpState();
-            if (initInterface() && initUdpSocket()) {
-                mDhcpPacketHandler = new DhcpPacketHandler(getHandler());
-                if (mDhcpPacketHandler.start()) return;
-                Log.e(TAG, "Fail to start DHCP Packet Handler");
+            if (initInterface() && initSockets()) {
+                mReceiveThread = new ReceiveThread();
+                mReceiveThread.start();
+            } else {
+                notifyFailure();
+                transitionTo(mStoppedState);
             }
-            notifyFailure();
-            transitionTo(mStoppedState);
         }
 
         @Override
         public void exit() {
-            if (mDhcpPacketHandler != null) {
-                mDhcpPacketHandler.stop();
-                if (DBG) Log.d(TAG, "DHCP Packet Handler stopped");
+            if (mReceiveThread != null) {
+                mReceiveThread.halt();  // Also closes sockets.
+                mReceiveThread = null;
             }
-            closeSocketQuietly(mUdpSock);
             clearDhcpState();
         }
 
@@ -830,42 +795,6 @@ public class DhcpClient extends StateMachine {
                 (leaseTimeMillis > 0) ? SystemClock.elapsedRealtime() + leaseTimeMillis : 0;
     }
 
-    abstract class TimeoutState extends LoggingState {
-        protected int mTimeout = 0;
-
-        @Override
-        public void enter() {
-            super.enter();
-            maybeInitTimeout();
-        }
-
-        @Override
-        public boolean processMessage(Message message) {
-            super.processMessage(message);
-            switch (message.what) {
-                case CMD_TIMEOUT:
-                    timeout();
-                    return HANDLED;
-                default:
-                    return NOT_HANDLED;
-            }
-        }
-
-        @Override
-        public void exit() {
-            super.exit();
-            mTimeoutAlarm.cancel();
-        }
-
-        protected abstract void timeout();
-        private void maybeInitTimeout() {
-            if (mTimeout > 0) {
-                long alarmTime = SystemClock.elapsedRealtime() + mTimeout;
-                mTimeoutAlarm.schedule(alarmTime);
-            }
-        }
-    }
-
     /**
      * Retransmits packets using jittered exponential backoff with an optional timeout. Packet
      * transmission is triggered by CMD_KICK, which is sent by an AlarmManager alarm. If a subclass
@@ -877,22 +806,22 @@ public class DhcpClient extends StateMachine {
      * packet needs to be transmitted, and receivePacket, which is triggered by CMD_RECEIVED_PACKET
      * sent by the receive thread. They may also set mTimeout and implement timeout.
      */
-    abstract class PacketRetransmittingState extends TimeoutState {
+    abstract class PacketRetransmittingState extends LoggingState {
+
         private int mTimer;
+        protected int mTimeout = 0;
 
         @Override
         public void enter() {
             super.enter();
             initTimer();
+            maybeInitTimeout();
             sendMessage(CMD_KICK);
         }
 
         @Override
         public boolean processMessage(Message message) {
-            if (super.processMessage(message) == HANDLED) {
-                return HANDLED;
-            }
-
+            super.processMessage(message);
             switch (message.what) {
                 case CMD_KICK:
                     sendPacket();
@@ -900,6 +829,9 @@ public class DhcpClient extends StateMachine {
                     return HANDLED;
                 case CMD_RECEIVED_PACKET:
                     receivePacket((DhcpPacket) message.obj);
+                    return HANDLED;
+                case CMD_TIMEOUT:
+                    timeout();
                     return HANDLED;
                 default:
                     return NOT_HANDLED;
@@ -910,10 +842,11 @@ public class DhcpClient extends StateMachine {
         public void exit() {
             super.exit();
             mKickAlarm.cancel();
+            mTimeoutAlarm.cancel();
         }
 
-        protected abstract boolean sendPacket();
-        protected abstract void receivePacket(DhcpPacket packet);
+        abstract protected boolean sendPacket();
+        abstract protected void receivePacket(DhcpPacket packet);
         protected void timeout() {}
 
         protected void initTimer() {
@@ -934,6 +867,13 @@ public class DhcpClient extends StateMachine {
             mTimer *= 2;
             if (mTimer > MAX_TIMEOUT_MS) {
                 mTimer = MAX_TIMEOUT_MS;
+            }
+        }
+
+        protected void maybeInitTimeout() {
+            if (mTimeout > 0) {
+                long alarmTime = SystemClock.elapsedRealtime() + mTimeout;
+                mTimeoutAlarm.schedule(alarmTime);
             }
         }
     }
@@ -1019,26 +959,11 @@ public class DhcpClient extends StateMachine {
 
         protected void receivePacket(DhcpPacket packet) {
             if (!isValidPacket(packet)) return;
-
-            // 1. received the DHCPOFFER packet, process it by following RFC2131.
-            // 2. received the DHCPACK packet from DHCP Servers who support Rapid
-            //    Commit option, process it by following RFC4039.
-            if (packet instanceof DhcpOfferPacket) {
-                mOffer = packet.toDhcpResults();
-                if (mOffer != null) {
-                    Log.d(TAG, "Got pending lease: " + mOffer);
-                    transitionTo(mDhcpRequestingState);
-                }
-            } else if (packet instanceof DhcpAckPacket) {
-                // If received DHCPACK packet w/o Rapid Commit option in this state,
-                // just drop it and wait for the next DHCPOFFER packet or DHCPACK w/
-                // Rapid Commit option.
-                if (!isDhcpRapidCommitEnabled() || !packet.mRapidCommit) return;
-                final DhcpResults results = packet.toDhcpResults();
-                if (results != null) {
-                    confirmDhcpLease(packet, results);
-                    transitionTo(mConfiguringInterfaceState);
-                }
+            if (!(packet instanceof DhcpOfferPacket)) return;
+            mOffer = packet.toDhcpResults();
+            if (mOffer != null) {
+                Log.d(TAG, "Got pending lease: " + mOffer);
+                transitionTo(mDhcpRequestingState);
             }
         }
     }
@@ -1065,7 +990,8 @@ public class DhcpClient extends StateMachine {
             if ((packet instanceof DhcpAckPacket)) {
                 DhcpResults results = packet.toDhcpResults();
                 if (results != null) {
-                    confirmDhcpLease(packet, results);
+                    setDhcpLeaseExpiry(packet);
+                    acceptDhcpResults(results, "Confirmed");
                     transitionTo(mConfiguringInterfaceState);
                 }
             } else if (packet instanceof DhcpNakPacket) {
@@ -1193,7 +1119,7 @@ public class DhcpClient extends StateMachine {
             startNewTransaction();
         }
 
-        protected abstract Inet4Address packetDestination();
+        abstract protected Inet4Address packetDestination();
 
         protected boolean sendPacket() {
             return sendRequestPacket(
@@ -1315,6 +1241,10 @@ public class DhcpClient extends StateMachine {
     }
 
     class DhcpRebootingState extends LoggingState {
+    }
+
+    private void logError(int errorCode) {
+        mMetricsLog.log(mIfaceName, new DhcpErrorEvent(errorCode));
     }
 
     private void logState(String name, int durationMs) {

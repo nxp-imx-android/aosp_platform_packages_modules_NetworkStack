@@ -16,8 +16,6 @@
 
 package android.net.ip;
 
-import static android.system.OsConstants.RT_SCOPE_UNIVERSE;
-
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -33,15 +31,12 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
-import static java.util.Collections.emptySet;
-
 import android.app.AlarmManager;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.res.Resources;
 import android.net.ConnectivityManager;
 import android.net.INetd;
-import android.net.InetAddresses;
 import android.net.IpPrefix;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
@@ -56,11 +51,11 @@ import android.net.util.InterfaceParams;
 import androidx.test.filters.SmallTest;
 import androidx.test.runner.AndroidJUnit4;
 
+import com.android.internal.R;
 import com.android.server.NetworkObserver;
 import com.android.server.NetworkObserverRegistry;
 import com.android.server.NetworkStackService;
 import com.android.server.connectivity.ipmemorystore.IpMemoryStoreService;
-import com.android.testutils.HandlerUtilsKt;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -69,8 +64,6 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 
-import java.net.Inet4Address;
-import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -84,6 +77,8 @@ import java.util.Set;
 @RunWith(AndroidJUnit4.class)
 @SmallTest
 public class IpClientTest {
+    private static final int DEFAULT_AVOIDBADWIFI_CONFIG_VALUE = 1;
+
     private static final String VALID = "VALID";
     private static final String INVALID = "INVALID";
     private static final String TEST_IFNAME = "test_wlan0";
@@ -93,19 +88,6 @@ public class IpClientTest {
     private static final int TEST_TIMEOUT_MS = 400;
     private static final String TEST_L2KEY = "some l2key";
     private static final String TEST_GROUPHINT = "some grouphint";
-
-    private static final String TEST_GLOBAL_ADDRESS = "1234:4321::548d:2db2:4fcf:ef75/64";
-    private static final String[] TEST_LOCAL_ADDRESSES = {
-            "fe80::a4be:f92:e1f7:22d1/64",
-            "fe80::f04a:8f6:6a32:d756/64",
-            "fd2c:4e57:8e3c:0:548d:2db2:4fcf:ef75/64"
-    };
-    private static final String TEST_IPV4_LINKADDRESS = "192.168.42.24/24";
-    private static final String[] TEST_PREFIXES = { "fe80::/64", "fd2c:4e57:8e3c::/64" };
-    private static final String[] TEST_DNSES = { "fd2c:4e57:8e3c::42" };
-    private static final String TEST_IPV6_GATEWAY = "fd2c:4e57:8e3c::43";
-    private static final String TEST_IPV4_GATEWAY = "192.168.42.11";
-    private static final long TEST_DNS_LIFETIME = 3600;
 
     @Mock private Context mContext;
     @Mock private ConnectivityManager mCm;
@@ -132,7 +114,8 @@ public class IpClientTest {
         when(mContext.getSystemService(eq(ConnectivityManager.class))).thenReturn(mCm);
         when(mContext.getResources()).thenReturn(mResources);
         when(mDependencies.getNetd(any())).thenReturn(mNetd);
-        when(mCm.shouldAvoidBadWifi()).thenReturn(true);
+        when(mResources.getInteger(R.integer.config_networkAvoidBadWifi))
+                .thenReturn(DEFAULT_AVOIDBADWIFI_CONFIG_VALUE);
         when(mContext.getContentResolver()).thenReturn(mContentResolver);
         when(mNetworkStackServiceManager.getIpMemoryStoreService())
                 .thenReturn(mIpMemoryStoreService);
@@ -226,20 +209,10 @@ public class IpClientTest {
         ipc.shutdown();
     }
 
-    private LinkProperties makeIPv6ProvisionedLinkProperties() {
-        // Add local addresses, and a global address with global scope
-        final Set<LinkAddress> addresses = links(TEST_LOCAL_ADDRESSES);
-        addresses.add(new LinkAddress(TEST_GLOBAL_ADDRESS, 0, RT_SCOPE_UNIVERSE));
-
-        // Add a route on the interface for each prefix, and a global route
-        final Set<RouteInfo> routes = routes(TEST_PREFIXES);
-        routes.add(defaultIPV6Route(TEST_IPV6_GATEWAY));
-
-        return linkproperties(addresses, routes, ips(TEST_DNSES));
-    }
-
-    private IpClient doProvisioningWithDefaultConfiguration() throws Exception {
-        final IpClient ipc = makeIpClient(TEST_IFNAME);
+    @Test
+    public void testDefaultProvisioningConfiguration() throws Exception {
+        final String iface = TEST_IFNAME;
+        final IpClient ipc = makeIpClient(iface);
 
         ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
                 .withoutIPv4()
@@ -251,115 +224,34 @@ public class IpClientTest {
         ipc.startProvisioning(config);
         verify(mCb, times(1)).setNeighborDiscoveryOffload(true);
         verify(mCb, timeout(TEST_TIMEOUT_MS).times(1)).setFallbackMulticastFilter(false);
-
-        final LinkProperties lp = makeIPv6ProvisionedLinkProperties();
-        lp.getRoutes().forEach(mObserver::onRouteUpdated);
-        lp.getLinkAddresses().forEach(la -> mObserver.onInterfaceAddressUpdated(la, TEST_IFNAME));
-        mObserver.onInterfaceDnsServerInfo(TEST_IFNAME, TEST_DNS_LIFETIME,
-                lp.getDnsServers().stream().map(InetAddress::getHostAddress)
-                        .toArray(String[]::new));
-
-        HandlerUtilsKt.waitForIdle(ipc.getHandler(), TEST_TIMEOUT_MS);
         verify(mCb, never()).onProvisioningFailure(any());
         verify(mIpMemoryStore, never()).storeNetworkAttributes(any(), any(), any());
 
-        verify(mCb).onProvisioningSuccess(lp);
-        return ipc;
-    }
-
-    private void addIPv4Provisioning(LinkProperties lp) {
-        final LinkAddress la = new LinkAddress(TEST_IPV4_LINKADDRESS);
-        final RouteInfo defaultRoute = new RouteInfo(new IpPrefix(Inet4Address.ANY, 0),
-                InetAddresses.parseNumericAddress(TEST_IPV4_GATEWAY), TEST_IFNAME);
-        mObserver.onInterfaceAddressUpdated(la, TEST_IFNAME);
-        mObserver.onRouteUpdated(defaultRoute);
-
-        lp.addLinkAddress(la);
-        lp.addRoute(defaultRoute);
-    }
-
-    /**
-     * Simulate loss of IPv6 provisioning (default route lost).
-     *
-     * @return The expected new LinkProperties.
-     */
-    private void doIPv6ProvisioningLoss(LinkProperties lp) {
-        final RouteInfo defaultRoute = defaultIPV6Route(TEST_IPV6_GATEWAY);
-        mObserver.onRouteRemoved(defaultRoute);
-
-        lp.removeRoute(defaultRoute);
-    }
-
-    private void doDefaultIPv6ProvisioningConfigurationAndProvisioningLossTest(boolean avoidBadWifi)
-            throws Exception {
-        when(mCm.shouldAvoidBadWifi()).thenReturn(avoidBadWifi);
-        final IpClient ipc = doProvisioningWithDefaultConfiguration();
-        final LinkProperties lp = makeIPv6ProvisionedLinkProperties();
-
-        reset(mCb);
-        doIPv6ProvisioningLoss(lp);
-        HandlerUtilsKt.waitForIdle(ipc.getHandler(), TEST_TIMEOUT_MS);
-        verify(mCb).onProvisioningFailure(lp);
-        verify(mCb).onLinkPropertiesChange(makeEmptyLinkProperties(TEST_IFNAME));
-
-        verifyShutdown(ipc);
+        ipc.shutdown();
+        verify(mNetd, timeout(TEST_TIMEOUT_MS).times(1)).interfaceSetEnableIPv6(iface, false);
+        verify(mNetd, timeout(TEST_TIMEOUT_MS).times(1)).interfaceClearAddrs(iface);
+        verify(mCb, timeout(TEST_TIMEOUT_MS).times(1))
+                .onLinkPropertiesChange(makeEmptyLinkProperties(iface));
     }
 
     @Test
-    public void testDefaultIPv6ProvisioningConfiguration_AvoidBadWifi() throws Exception {
-        doDefaultIPv6ProvisioningConfigurationAndProvisioningLossTest(true /* avoidBadWifi */);
-    }
-
-    @Test
-    public void testDefaultIPv6ProvisioningConfiguration_StayOnBadWifi() throws Exception {
-        // Even when avoidBadWifi=false, if IPv6 only, loss of all provisioning causes
-        // onProvisioningFailure to be called.
-        doDefaultIPv6ProvisioningConfigurationAndProvisioningLossTest(false /* avoidBadWifi */);
-    }
-
-    private void doDefaultDualStackProvisioningConfigurationTest(
-            boolean avoidBadWifi) throws Exception {
-        when(mCm.shouldAvoidBadWifi()).thenReturn(avoidBadWifi);
-        final IpClient ipc = doProvisioningWithDefaultConfiguration();
-        final LinkProperties lp = makeIPv6ProvisionedLinkProperties();
-        addIPv4Provisioning(lp);
-        HandlerUtilsKt.waitForIdle(ipc.getHandler(), TEST_TIMEOUT_MS);
-
-        reset(mCb);
-        doIPv6ProvisioningLoss(lp);
-        HandlerUtilsKt.waitForIdle(ipc.getHandler(), TEST_TIMEOUT_MS);
-        if (avoidBadWifi) { // Provisioning failure is expected only when avoidBadWifi is true
-            verify(mCb).onProvisioningFailure(lp);
-            verify(mCb).onLinkPropertiesChange(makeEmptyLinkProperties(TEST_IFNAME));
-        } else {
-            verify(mCb, never()).onProvisioningFailure(any());
-            verify(mCb).onLinkPropertiesChange(lp);
-        }
-
-        verifyShutdown(ipc);
-    }
-
-    @Test
-    public void testDefaultDualStackProvisioningConfiguration_AvoidBadWifi() throws Exception {
-        doDefaultDualStackProvisioningConfigurationTest(true /* avoidBadWifi */);
-    }
-
-    @Test
-    public void testDefaultDualStackProvisioningConfiguration_StayOnBadWifi() throws Exception {
-        doDefaultDualStackProvisioningConfigurationTest(false /* avoidBadWifi */);
-    }
-
     public void testProvisioningWithInitialConfiguration() throws Exception {
         final String iface = TEST_IFNAME;
         final IpClient ipc = makeIpClient(iface);
         final String l2Key = TEST_L2KEY;
         final String groupHint = TEST_GROUPHINT;
 
+        String[] addresses = {
+            "fe80::a4be:f92:e1f7:22d1/64",
+            "fe80::f04a:8f6:6a32:d756/64",
+            "fd2c:4e57:8e3c:0:548d:2db2:4fcf:ef75/64"
+        };
+        String[] prefixes = { "fe80::/64", "fd2c:4e57:8e3c::/64" };
+
         ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
                 .withoutIPv4()
                 .withoutIpReachabilityMonitor()
-                .withInitialConfiguration(
-                        conf(links(TEST_LOCAL_ADDRESSES), prefixes(TEST_PREFIXES), ips()))
+                .withInitialConfiguration(conf(links(addresses), prefixes(prefixes), ips()))
                 .build();
 
         ipc.startProvisioning(config);
@@ -368,38 +260,35 @@ public class IpClientTest {
         verify(mCb, never()).onProvisioningFailure(any());
         ipc.setL2KeyAndGroupHint(l2Key, groupHint);
 
-        for (String addr : TEST_LOCAL_ADDRESSES) {
+        for (String addr : addresses) {
             String[] parts = addr.split("/");
             verify(mNetd, timeout(TEST_TIMEOUT_MS).times(1))
                     .interfaceAddAddress(iface, parts[0], Integer.parseInt(parts[1]));
         }
 
-        final int lastAddr = TEST_LOCAL_ADDRESSES.length - 1;
+        final int lastAddr = addresses.length - 1;
 
         // Add N - 1 addresses
         for (int i = 0; i < lastAddr; i++) {
-            mObserver.onInterfaceAddressUpdated(new LinkAddress(TEST_LOCAL_ADDRESSES[i]), iface);
+            mObserver.onInterfaceAddressUpdated(new LinkAddress(addresses[i]), iface);
             verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(any());
             reset(mCb);
         }
 
         // Add Nth address
-        mObserver.onInterfaceAddressUpdated(new LinkAddress(TEST_LOCAL_ADDRESSES[lastAddr]), iface);
-        LinkProperties want = linkproperties(links(TEST_LOCAL_ADDRESSES),
-                routes(TEST_PREFIXES), emptySet() /* dnses */);
+        mObserver.onInterfaceAddressUpdated(new LinkAddress(addresses[lastAddr]), iface);
+        LinkProperties want = linkproperties(links(addresses), routes(prefixes));
         want.setInterfaceName(iface);
         verify(mCb, timeout(TEST_TIMEOUT_MS).times(1)).onProvisioningSuccess(want);
         verifyNetworkAttributesStored(l2Key, new NetworkAttributes.Builder()
                 .setGroupHint(groupHint)
                 .build());
-    }
 
-    private void verifyShutdown(IpClient ipc) throws Exception {
         ipc.shutdown();
-        verify(mNetd, timeout(TEST_TIMEOUT_MS).times(1)).interfaceSetEnableIPv6(TEST_IFNAME, false);
-        verify(mNetd, timeout(TEST_TIMEOUT_MS).times(1)).interfaceClearAddrs(TEST_IFNAME);
+        verify(mNetd, timeout(TEST_TIMEOUT_MS).times(1)).interfaceSetEnableIPv6(iface, false);
+        verify(mNetd, timeout(TEST_TIMEOUT_MS).times(1)).interfaceClearAddrs(iface);
         verify(mCb, timeout(TEST_TIMEOUT_MS).times(1))
-                .onLinkPropertiesChange(makeEmptyLinkProperties(TEST_IFNAME));
+                .onLinkPropertiesChange(makeEmptyLinkProperties(iface));
         verifyNoMoreInteractions(mIpMemoryStore);
     }
 
@@ -471,7 +360,7 @@ public class IpClientTest {
             Set<RouteInfo> lpRoutes, Set<InetAddress> lpDns, InitialConfiguration config) {
         IsProvisionedTestCase testcase = new IsProvisionedTestCase();
         testcase.isProvisioned = isProvisioned;
-        testcase.lp = makeEmptyLinkProperties(TEST_IFNAME);
+        testcase.lp = new LinkProperties();
         testcase.lp.setLinkAddresses(lpAddrs);
         for (RouteInfo route : lpRoutes) {
             testcase.lp.addRoute(route);
@@ -567,12 +456,12 @@ public class IpClientTest {
         return testcase;
     }
 
-    static LinkProperties linkproperties(Set<LinkAddress> addresses,
-            Set<RouteInfo> routes, Set<InetAddress> dnses) {
-        LinkProperties lp = makeEmptyLinkProperties(TEST_IFNAME);
+    static LinkProperties linkproperties(Set<LinkAddress> addresses, Set<RouteInfo> routes) {
+        LinkProperties lp = new LinkProperties();
         lp.setLinkAddresses(addresses);
-        routes.forEach(lp::addRoute);
-        dnses.forEach(lp::addDnsServer);
+        for (RouteInfo route : routes) {
+            lp.addRoute(route);
+        }
         return lp;
     }
 
@@ -590,13 +479,7 @@ public class IpClientTest {
     }
 
     static Set<RouteInfo> routes(String... routes) {
-        return mapIntoSet(routes, (r) -> new RouteInfo(new IpPrefix(r), null /* gateway */,
-                TEST_IFNAME));
-    }
-
-    static RouteInfo defaultIPV6Route(String gateway) {
-        return new RouteInfo(new IpPrefix(Inet6Address.ANY, 0),
-                InetAddresses.parseNumericAddress(gateway), TEST_IFNAME);
+        return mapIntoSet(routes, (r) -> new RouteInfo(new IpPrefix(r)));
     }
 
     static Set<IpPrefix> prefixes(String... prefixes) {

@@ -54,7 +54,6 @@ public final class NetworkStackConstants {
     public static final int ETHER_TYPE_IPV4 = 0x0800;
     public static final int ETHER_TYPE_IPV6 = 0x86dd;
     public static final int ETHER_HEADER_LEN = 14;
-    public static final int ETHER_MTU = 1500;
 
     /**
      * ARP constants.
@@ -95,11 +94,9 @@ public final class NetworkStackConstants {
      */
     public static final int IPV6_ADDR_LEN = 16;
     public static final int IPV6_HEADER_LEN = 40;
-    public static final int IPV6_LEN_OFFSET = 4;
     public static final int IPV6_PROTOCOL_OFFSET = 6;
     public static final int IPV6_SRC_ADDR_OFFSET = 8;
     public static final int IPV6_DST_ADDR_OFFSET = 24;
-    public static final int IPV6_MIN_MTU = 1280;
 
     /**
      * ICMPv6 constants.
@@ -109,7 +106,6 @@ public final class NetworkStackConstants {
      *     - https://tools.ietf.org/html/rfc4861
      */
     public static final int ICMPV6_HEADER_MIN_LEN = 4;
-    public static final int ICMPV6_CHECKSUM_OFFSET = 2;
     public static final int ICMPV6_ECHO_REPLY_TYPE = 129;
     public static final int ICMPV6_ECHO_REQUEST_TYPE = 128;
     public static final int ICMPV6_ROUTER_SOLICITATION    = 133;
@@ -118,14 +114,9 @@ public final class NetworkStackConstants {
     public static final int ICMPV6_NEIGHBOR_ADVERTISEMENT = 136;
     public static final int ICMPV6_ND_OPTION_MIN_LENGTH = 8;
     public static final int ICMPV6_ND_OPTION_LENGTH_SCALING_FACTOR = 8;
-    public static final int ICMPV6_ND_OPTION_SLLA  = 1;
-    public static final int ICMPV6_ND_OPTION_TLLA  = 2;
-    public static final int ICMPV6_ND_OPTION_PIO   = 3;
-    public static final int ICMPV6_ND_OPTION_MTU   = 5;
-    public static final int ICMPV6_ND_OPTION_RDNSS = 25;
-
-
-    public static final int ICMPV6_RA_HEADER_LEN = 16;
+    public static final int ICMPV6_ND_OPTION_SLLA = 1;
+    public static final int ICMPV6_ND_OPTION_TLLA = 2;
+    public static final int ICMPV6_ND_OPTION_MTU  = 5;
 
     /**
      * UDP constants.

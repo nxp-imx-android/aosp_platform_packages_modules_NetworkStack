@@ -62,12 +62,13 @@ import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_MODE_PROMPT;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_OTHER_FALLBACK_URLS;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_USER_AGENT;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_USE_HTTPS;
+import static android.net.util.NetworkStackUtils.NAMESPACE_CONNECTIVITY;
 import static android.net.util.NetworkStackUtils.isEmpty;
-import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 
-import static com.android.networkstack.util.DnsUtils.PRIVATE_DNS_PROBE_HOST_SUFFIX;
 import static com.android.networkstack.util.DnsUtils.TYPE_ADDRCONFIG;
 
+import android.annotation.NonNull;
+import android.annotation.Nullable;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -113,8 +114,6 @@ import android.util.Log;
 import android.util.Pair;
 
 import androidx.annotation.ArrayRes;
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 import androidx.annotation.StringRes;
 
 import com.android.internal.annotations.VisibleForTesting;
@@ -368,13 +367,7 @@ public class NetworkMonitor extends StateMachine {
         } catch (RemoteException e) {
             version = 0;
         }
-        // The AIDL was freezed from Q beta 5 but it's unfreezing from R before releasing. In order
-        // to distinguish the behavior between R and Q beta 5 and before Q beta 5, add SDK and
-        // CODENAME check here. Basically, it's only expected to return 0 for Q beta 4 and below
-        // because the test result has changed.
-        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q
-                && Build.VERSION.CODENAME.equals("REL")
-                && version == Build.VERSION_CODES.CUR_DEVELOPMENT) version = 0;
+        if (version == Build.VERSION_CODES.CUR_DEVELOPMENT) version = 0;
         return version;
     }
 
@@ -385,7 +378,7 @@ public class NetworkMonitor extends StateMachine {
     }
 
     @VisibleForTesting
-    public NetworkMonitor(Context context, INetworkMonitorCallbacks cb, Network network,
+    protected NetworkMonitor(Context context, INetworkMonitorCallbacks cb, Network network,
             IpConnectivityLog logger, SharedLog validationLogs,
             Dependencies deps, DataStallStatsUtils detectionStatsUtils) {
         // Add suffix indicating which NetworkMonitor we're talking about.
@@ -561,14 +554,6 @@ public class NetworkMonitor extends StateMachine {
         }
     }
 
-    private void notifyProbeStatusChanged(int probesCompleted, int probesSucceeded) {
-        try {
-            mCallback.notifyProbeStatusChanged(probesCompleted, probesSucceeded);
-        } catch (RemoteException e) {
-            Log.e(TAG, "Error sending probe status", e);
-        }
-    }
-
     private void showProvisioningNotification(String action) {
         try {
             mCallback.showProvisioningNotification(action, mContext.getPackageName());
@@ -681,8 +666,6 @@ public class NetworkMonitor extends StateMachine {
                     //         no resolved IP addresses, IPs unreachable,
                     //         port 853 unreachable, port 853 is not running a
                     //         DNS-over-TLS server, et cetera).
-                    // Cancel any outstanding CMD_EVALUATE_PRIVATE_DNS.
-                    removeMessages(CMD_EVALUATE_PRIVATE_DNS);
                     sendMessage(CMD_EVALUATE_PRIVATE_DNS);
                     break;
                 }
@@ -1036,19 +1019,11 @@ public class NetworkMonitor extends StateMachine {
                             handlePrivateDnsEvaluationFailure();
                             break;
                         }
-                        handlePrivateDnsEvaluationSuccess();
-                    } else {
-                        mEvaluationState.removeProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS);
                     }
 
                     // All good!
                     transitionTo(mValidatedState);
                     break;
-                case CMD_PRIVATE_DNS_SETTINGS_CHANGED:
-                    // When settings change the reevaluation timer must be reset.
-                    mPrivateDnsReevalDelayMs = INITIAL_REEVALUATE_DELAY_MS;
-                    // Let the message bubble up and be handled by parent states as usual.
-                    return NOT_HANDLED;
                 default:
                     return NOT_HANDLED;
             }
@@ -1069,12 +1044,15 @@ public class NetworkMonitor extends StateMachine {
             try {
                 // Do a blocking DNS resolution using the network-assigned nameservers.
                 final InetAddress[] ips = DnsUtils.getAllByName(mDependencies.getDnsResolver(),
-                        mCleartextDnsNetwork, mPrivateDnsProviderHostname, getDnsProbeTimeout(),
-                        str -> validationLog("Strict mode hostname resolution " + str));
+                        mCleartextDnsNetwork, mPrivateDnsProviderHostname, getDnsProbeTimeout());
                 mPrivateDnsConfig = new PrivateDnsConfig(mPrivateDnsProviderHostname, ips);
+                validationLog("Strict mode hostname resolved: " + mPrivateDnsConfig);
             } catch (UnknownHostException uhe) {
                 mPrivateDnsConfig = null;
+                validationLog("Strict mode hostname resolution failed: " + uhe.getMessage());
             }
+            mEvaluationState.noteProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS,
+                    (mPrivateDnsConfig != null) /* succeeded */);
         }
 
         private void notifyPrivateDnsConfigResolved() {
@@ -1085,14 +1063,7 @@ public class NetworkMonitor extends StateMachine {
             }
         }
 
-        private void handlePrivateDnsEvaluationSuccess() {
-            mEvaluationState.noteProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS,
-                    true /* succeeded */);
-        }
-
         private void handlePrivateDnsEvaluationFailure() {
-            mEvaluationState.noteProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS,
-                    false /* succeeded */);
             mEvaluationState.reportEvaluationResult(NETWORK_VALIDATION_RESULT_INVALID,
                     null /* redirectUrl */);
             // Queue up a re-evaluation with backoff.
@@ -1101,6 +1072,10 @@ public class NetworkMonitor extends StateMachine {
             // transitioning back to EvaluatingState, to perhaps give ourselves
             // the opportunity to (re)detect a captive portal or something.
             //
+            // TODO: distinguish between CMD_EVALUATE_PRIVATE_DNS messages that are caused by server
+            // lookup failures (which should continue to do exponential backoff) and
+            // CMD_EVALUATE_PRIVATE_DNS messages that are caused by user reconfiguration (which
+            // should be processed immediately.
             sendMessageDelayed(CMD_EVALUATE_PRIVATE_DNS, mPrivateDnsReevalDelayMs);
             mPrivateDnsReevalDelayMs *= 2;
             if (mPrivateDnsReevalDelayMs > MAX_REEVALUATE_DELAY_MS) {
@@ -1109,8 +1084,10 @@ public class NetworkMonitor extends StateMachine {
         }
 
         private boolean sendPrivateDnsProbe() {
+            // q.v. system/netd/server/dns/DnsTlsTransport.cpp
+            final String oneTimeHostnameSuffix = "-dnsotls-ds.metric.gstatic.com";
             final String host = UUID.randomUUID().toString().substring(0, 8)
-                    + PRIVATE_DNS_PROBE_HOST_SUFFIX;
+                    + oneTimeHostnameSuffix;
             final Stopwatch watch = new Stopwatch().start();
             boolean success = false;
             long time;
@@ -1126,6 +1103,7 @@ public class NetworkMonitor extends StateMachine {
                         String.format("%dms - Error: %s", time, uhe.getMessage()));
             }
             logValidationProbe(time, PROBE_PRIVDNS, success ? DNS_SUCCESS : DNS_FAILURE);
+            mEvaluationState.noteProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS, success);
             return success;
         }
     }
@@ -1175,6 +1153,7 @@ public class NetworkMonitor extends StateMachine {
                     } else if (probeResult.isPartialConnectivity()) {
                         mEvaluationState.reportEvaluationResult(NETWORK_VALIDATION_RESULT_PARTIAL,
                                 null /* redirectUrl */);
+                        // Check if disable https probing needed.
                         maybeDisableHttpsProbing(mAcceptPartialConnectivity);
                         if (mAcceptPartialConnectivity) {
                             transitionTo(mEvaluatingPrivateDnsState);
@@ -1578,8 +1557,7 @@ public class NetworkMonitor extends StateMachine {
     protected InetAddress[] sendDnsProbeWithTimeout(String host, int timeoutMs)
                 throws UnknownHostException {
         return DnsUtils.getAllByName(mDependencies.getDnsResolver(), mCleartextDnsNetwork, host,
-                TYPE_ADDRCONFIG, FLAG_EMPTY, timeoutMs,
-                str -> validationLog(ValidationProbeEvent.PROBE_DNS, host, str));
+                TYPE_ADDRCONFIG, FLAG_EMPTY, timeoutMs);
     }
 
     /** Do a DNS resolution of the given server. */
@@ -1594,11 +1572,19 @@ public class NetworkMonitor extends StateMachine {
         String connectInfo;
         try {
             InetAddress[] addresses = sendDnsProbeWithTimeout(host, getDnsProbeTimeout());
+            StringBuffer buffer = new StringBuffer();
+            for (InetAddress address : addresses) {
+                buffer.append(',').append(address.getHostAddress());
+            }
             result = ValidationProbeEvent.DNS_SUCCESS;
+            connectInfo = "OK " + buffer.substring(1);
         } catch (UnknownHostException e) {
             result = ValidationProbeEvent.DNS_FAILURE;
+            connectInfo = "FAIL";
         }
         final long latency = watch.stop();
+        validationLog(ValidationProbeEvent.PROBE_DNS, host,
+                String.format("%dms %s", latency, connectInfo));
         logValidationProbe(latency, ValidationProbeEvent.PROBE_DNS, result);
     }
 
@@ -1867,7 +1853,8 @@ public class NetworkMonitor extends StateMachine {
             latencyBroadcast.putExtra(NetworkMonitorUtils.EXTRA_RESPONSE_TIMESTAMP_MS,
                     responseTimestampMs);
         }
-        mDependencies.sendNetworkConditionsBroadcast(mContext, latencyBroadcast);
+        mContext.sendBroadcastAsUser(latencyBroadcast, UserHandle.CURRENT,
+                NetworkMonitorUtils.PERMISSION_ACCESS_NETWORK_CONDITIONS);
     }
 
     private void logNetworkEvent(int evtype) {
@@ -1912,7 +1899,7 @@ public class NetworkMonitor extends StateMachine {
     }
 
     @VisibleForTesting
-    public static class Dependencies {
+    static class Dependencies {
         public Network getPrivateDnsBypassNetwork(Network network) {
             return new OneAddressPerFamilyNetwork(network);
         }
@@ -1969,15 +1956,6 @@ public class NetworkMonitor extends StateMachine {
         public int getDeviceConfigPropertyInt(@NonNull String namespace, @NonNull String name,
                 int defaultValue) {
             return NetworkStackUtils.getDeviceConfigPropertyInt(namespace, name, defaultValue);
-        }
-
-        /**
-         * Send a broadcast indicating network conditions.
-         */
-        public void sendNetworkConditionsBroadcast(@NonNull Context context,
-                @NonNull Intent broadcast) {
-            context.sendBroadcastAsUser(broadcast, UserHandle.CURRENT,
-                    NetworkMonitorUtils.PERMISSION_ACCESS_NETWORK_CONDITIONS);
         }
 
         public static final Dependencies DEFAULT = new Dependencies();
@@ -2129,41 +2107,20 @@ public class NetworkMonitor extends StateMachine {
         // Indicates which probes have completed since clearProbeResults was called.
         // This is a bitmask of INetworkMonitor.NETWORK_VALIDATION_PROBE_* constants.
         private int mProbeResults = 0;
-        // A bitmask to record which probes are completed.
-        private int mProbeCompleted = 0;
         // The latest redirect URL.
         private String mRedirectUrl;
 
         protected void clearProbeResults() {
             mProbeResults = 0;
-            mProbeCompleted = 0;
         }
 
-        private void maybeNotifyProbeResults(@NonNull final Runnable modif) {
-            final int oldCompleted = mProbeCompleted;
-            final int oldResults = mProbeResults;
-            modif.run();
-            if (oldCompleted != mProbeCompleted || oldResults != mProbeResults) {
-                notifyProbeStatusChanged(mProbeCompleted, mProbeResults);
-            }
-        }
-
-        protected void removeProbeResult(final int probeResult) {
-            maybeNotifyProbeResults(() -> {
-                mProbeCompleted &= ~probeResult;
+        // Probe result for http probe should be updated from reportHttpProbeResult().
+        protected void noteProbeResult(int probeResult, boolean succeeded) {
+            if (succeeded) {
+                mProbeResults |= probeResult;
+            } else {
                 mProbeResults &= ~probeResult;
-            });
-        }
-
-        protected void noteProbeResult(final int probeResult, final boolean succeeded) {
-            maybeNotifyProbeResults(() -> {
-                mProbeCompleted |= probeResult;
-                if (succeeded) {
-                    mProbeResults |= probeResult;
-                } else {
-                    mProbeResults &= ~probeResult;
-                }
-            });
+            }
         }
 
         protected void reportEvaluationResult(int result, @Nullable String redirectUrl) {
@@ -2183,11 +2140,6 @@ public class NetworkMonitor extends StateMachine {
                 return NETWORK_TEST_RESULT_INVALID;
             }
             return mEvaluationResult | mProbeResults;
-        }
-
-        @VisibleForTesting
-        protected int getProbeCompletedResult() {
-            return mProbeCompleted;
         }
     }
 
@@ -2222,15 +2174,5 @@ public class NetworkMonitor extends StateMachine {
             probeResult |= NETWORK_VALIDATION_PROBE_DNS;
         }
         mEvaluationState.noteProbeResult(probeResult, succeeded);
-    }
-
-    /**
-     * Interface for logging dns results.
-     */
-    public interface DnsLogFunc {
-        /**
-         * Log function.
-         */
-        void log(String s);
     }
 }

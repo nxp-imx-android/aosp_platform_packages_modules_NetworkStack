@@ -22,7 +22,7 @@ import java.nio.ByteBuffer;
 /**
  * Implements DHCP-RELEASE
  */
-public class DhcpReleasePacket extends DhcpPacket {
+class DhcpReleasePacket extends DhcpPacket {
 
     final Inet4Address mClientAddr;
 
