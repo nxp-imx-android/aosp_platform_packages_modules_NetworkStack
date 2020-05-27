@@ -74,6 +74,7 @@ import android.net.util.InterfaceParams;
 import android.net.util.NetworkStackUtils;
 import android.net.util.PacketReader;
 import android.net.util.SocketUtils;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Message;
 import android.os.PowerManager;
@@ -98,6 +99,7 @@ import com.android.internal.util.WakeupMessage;
 import com.android.networkstack.R;
 import com.android.networkstack.apishim.CaptivePortalDataShimImpl;
 import com.android.networkstack.apishim.SocketUtilsShimImpl;
+import com.android.networkstack.apishim.common.ShimUtils;
 import com.android.networkstack.arp.ArpPacket;
 
 import java.io.FileDescriptor;
@@ -149,8 +151,8 @@ public class DhcpClient extends StateMachine {
 
     // Timers and timeouts.
     private static final int SECONDS = 1000;
-    private static final int FIRST_TIMEOUT_MS         =   2 * SECONDS;
-    private static final int MAX_TIMEOUT_MS           = 128 * SECONDS;
+    private static final int FIRST_TIMEOUT_MS         =   1 * SECONDS;
+    private static final int MAX_TIMEOUT_MS           = 512 * SECONDS;
     private static final int IPMEMORYSTORE_TIMEOUT_MS =   1 * SECONDS;
 
     // The waiting time to restart the DHCP configuration process after broadcasting a
@@ -198,8 +200,8 @@ public class DhcpClient extends StateMachine {
 
     // This is not strictly needed, since the client is asynchronous and implements exponential
     // backoff. It's maintained for backwards compatibility with the previous DHCP code, which was
-    // a blocking operation with a 30-second timeout. We pick 36 seconds so we can send packets at
-    // t=0, t=2, t=6, t=14, t=30, allowing for 10% jitter.
+    // a blocking operation with a 30-second timeout. We pick 18 seconds so we can send packets at
+    // t=0, t=1, t=3, t=7, t=16, allowing for 10% jitter.
     private static final int DHCP_TIMEOUT_MS    =  36 * SECONDS;
 
     // DhcpClient uses IpClient's handler.
@@ -407,8 +409,10 @@ public class DhcpClient extends StateMachine {
          * Return whether a feature guarded by a feature flag is enabled.
          * @see NetworkStackUtils#isFeatureEnabled(Context, String, String)
          */
-        public boolean isFeatureEnabled(final Context context, final String name) {
-            return NetworkStackUtils.isFeatureEnabled(context, NAMESPACE_CONNECTIVITY, name);
+        public boolean isFeatureEnabled(final Context context, final String name,
+                boolean defaultEnabled) {
+            return NetworkStackUtils.isFeatureEnabled(context, NAMESPACE_CONNECTIVITY, name,
+                    defaultEnabled);
         }
 
         /**
@@ -496,23 +500,32 @@ public class DhcpClient extends StateMachine {
 
     /**
      * check whether or not to support caching the last lease info and INIT-REBOOT state.
+     *
+     * INIT-REBOOT state is supported on Android R by default if there is no experiment flag set to
+     * disable this feature explicitly, meanwhile we still hope to be able to control this feature
+     * on/off by pushing experiment flag for A/B testing and metrics collection on both of Android
+     * Q and R version, however it's disbled on Android Q by default.
      */
     public boolean isDhcpLeaseCacheEnabled() {
-        return mDependencies.isFeatureEnabled(mContext, DHCP_INIT_REBOOT_VERSION);
+        final boolean defaultEnabled =
+                ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q);
+        return mDependencies.isFeatureEnabled(mContext, DHCP_INIT_REBOOT_VERSION, defaultEnabled);
     }
 
     /**
      * check whether or not to support DHCP Rapid Commit option.
      */
     public boolean isDhcpRapidCommitEnabled() {
-        return mDependencies.isFeatureEnabled(mContext, DHCP_RAPID_COMMIT_VERSION);
+        return mDependencies.isFeatureEnabled(mContext, DHCP_RAPID_COMMIT_VERSION,
+                false /* defaultEnabled */);
     }
 
     /**
      * check whether or not to support IP address conflict detection and DHCPDECLINE.
      */
     public boolean isDhcpIpConflictDetectEnabled() {
-        return mDependencies.isFeatureEnabled(mContext, DHCP_IP_CONFLICT_DETECT_VERSION);
+        return mDependencies.isFeatureEnabled(mContext, DHCP_IP_CONFLICT_DETECT_VERSION,
+                false /* defaultEnabled */);
     }
 
     private void confirmDhcpLease(DhcpPacket packet, DhcpResults results) {

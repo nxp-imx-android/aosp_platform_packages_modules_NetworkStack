@@ -64,7 +64,6 @@ import android.text.TextUtils;
 import android.util.LocalLog;
 import android.util.Log;
 import android.util.Pair;
-import android.util.Patterns;
 import android.util.SparseArray;
 
 import androidx.annotation.NonNull;
@@ -77,15 +76,17 @@ import com.android.internal.util.MessageUtils;
 import com.android.internal.util.State;
 import com.android.internal.util.StateMachine;
 import com.android.internal.util.WakeupMessage;
-import com.android.networkstack.apishim.NetworkInformationShim;
 import com.android.networkstack.apishim.NetworkInformationShimImpl;
-import com.android.networkstack.apishim.ShimUtils;
+import com.android.networkstack.apishim.common.NetworkInformationShim;
+import com.android.networkstack.apishim.common.ShimUtils;
 import com.android.server.NetworkObserverRegistry;
 import com.android.server.NetworkStackService.NetworkStackServiceManager;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.net.InetAddress;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -457,7 +458,7 @@ public class IpClient extends StateMachine {
     private final SharedLog mLog;
     private final LocalLog mConnectivityPacketLog;
     private final MessageHandlingLogger mMsgStateLogger;
-    private final IpConnectivityLog mMetricsLog = new IpConnectivityLog();
+    private final IpConnectivityLog mMetricsLog;
     private final InterfaceController mInterfaceCtrl;
 
     // Ignore nonzero RDNSS option lifetimes below this value. 0 = disabled.
@@ -536,6 +537,13 @@ public class IpClient extends StateMachine {
             return NetworkStackUtils.getDeviceConfigPropertyInt(NAMESPACE_CONNECTIVITY, name,
                     defaultValue);
         }
+
+        /**
+         * Get a IpConnectivityLog instance.
+         */
+        public IpConnectivityLog getIpConnectivityLog() {
+            return new IpConnectivityLog();
+        }
     }
 
     public IpClient(Context context, String ifName, IIpClientCallbacks callback,
@@ -557,6 +565,7 @@ public class IpClient extends StateMachine {
         mInterfaceName = ifName;
         mClatInterfaceName = CLAT_PREFIX + ifName;
         mDependencies = deps;
+        mMetricsLog = deps.getIpConnectivityLog();
         mShutdownLatch = new CountDownLatch(1);
         mCm = mContext.getSystemService(ConnectivityManager.class);
         mObserverRegistry = observerRegistry;
@@ -1255,9 +1264,9 @@ public class IpClient extends StateMachine {
             }
 
             final String capportUrl = mDhcpResults.captivePortalApiUrl;
-            // Uri.parse does no syntax check; do a simple regex check to eliminate garbage.
+            // Uri.parse does no syntax check; do a simple check to eliminate garbage.
             // If the URL is still incorrect data fetching will fail later, which is fine.
-            if (capportUrl != null && Patterns.WEB_URL.matcher(capportUrl).matches()) {
+            if (isParseableUrl(capportUrl)) {
                 NetworkInformationShimImpl.newInstance()
                         .setCaptivePortalApiUrl(newLp, Uri.parse(capportUrl));
             }
@@ -1293,6 +1302,19 @@ public class IpClient extends StateMachine {
         // TODO: also learn via netlink routes specified by an InitialConfiguration and specified
         // from a static IP v4 config instead of manually patching them in in steps [3] and [5].
         return newLp;
+    }
+
+    private static boolean isParseableUrl(String url) {
+        // Verify that a URL has a reasonable format that can be parsed as per the URL constructor.
+        // This does not use Patterns.WEB_URL as that pattern excludes URLs without TLDs, such as on
+        // localhost.
+        if (url == null) return false;
+        try {
+            new URL(url);
+            return true;
+        } catch (MalformedURLException e) {
+            return false;
+        }
     }
 
     private static void addAllReachableDnsServers(

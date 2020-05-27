@@ -48,6 +48,7 @@ import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_MIN_EVALUATE_INT
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_TCP_POLLING_INTERVAL;
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_VALID_DNS_TIME_THRESHOLD;
 import static android.net.util.DataStallUtils.DATA_STALL_EVALUATION_TYPE_DNS;
+import static android.net.util.DataStallUtils.DATA_STALL_EVALUATION_TYPE_NONE;
 import static android.net.util.DataStallUtils.DATA_STALL_EVALUATION_TYPE_TCP;
 import static android.net.util.DataStallUtils.DEFAULT_CONSECUTIVE_DNS_TIMEOUT_THRESHOLD;
 import static android.net.util.DataStallUtils.DEFAULT_DATA_STALL_EVALUATION_TYPES;
@@ -67,10 +68,15 @@ import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_OTHER_HTTPS_URLS
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_OTHER_HTTP_URLS;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_USER_AGENT;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_USE_HTTPS;
+import static android.net.util.NetworkStackUtils.DEFAULT_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT;
+import static android.net.util.NetworkStackUtils.DEFAULT_CAPTIVE_PORTAL_FALLBACK_PROBE_SPECS;
 import static android.net.util.NetworkStackUtils.DEFAULT_CAPTIVE_PORTAL_HTTPS_URLS;
 import static android.net.util.NetworkStackUtils.DEFAULT_CAPTIVE_PORTAL_HTTP_URLS;
 import static android.net.util.NetworkStackUtils.DISMISS_PORTAL_IN_VALIDATED_NETWORK;
 import static android.net.util.NetworkStackUtils.DNS_PROBE_PRIVATE_IP_NO_INTERNET_VERSION;
+import static android.net.util.NetworkStackUtils.TEST_CAPTIVE_PORTAL_HTTPS_URL;
+import static android.net.util.NetworkStackUtils.TEST_CAPTIVE_PORTAL_HTTP_URL;
+import static android.net.util.NetworkStackUtils.TEST_URL_EXPIRATION_TIME;
 import static android.net.util.NetworkStackUtils.isEmpty;
 import static android.net.util.NetworkStackUtils.isIPv6ULA;
 import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
@@ -107,6 +113,7 @@ import android.net.metrics.NetworkEvent;
 import android.net.metrics.ValidationProbeEvent;
 import android.net.shared.NetworkMonitorUtils;
 import android.net.shared.PrivateDnsConfig;
+import android.net.util.DataStallUtils.EvaluationType;
 import android.net.util.NetworkStackUtils;
 import android.net.util.SharedLog;
 import android.net.util.Stopwatch;
@@ -119,6 +126,7 @@ import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
 import android.os.UserHandle;
+import android.provider.DeviceConfig;
 import android.provider.Settings;
 import android.telephony.AccessNetworkConstants;
 import android.telephony.CellIdentityNr;
@@ -152,11 +160,11 @@ import com.android.internal.util.StateMachine;
 import com.android.internal.util.TrafficStatsConstants;
 import com.android.networkstack.NetworkStackNotifier;
 import com.android.networkstack.R;
-import com.android.networkstack.apishim.CaptivePortalDataShim;
 import com.android.networkstack.apishim.CaptivePortalDataShimImpl;
 import com.android.networkstack.apishim.NetworkInformationShimImpl;
-import com.android.networkstack.apishim.ShimUtils;
-import com.android.networkstack.apishim.UnsupportedApiLevelException;
+import com.android.networkstack.apishim.common.CaptivePortalDataShim;
+import com.android.networkstack.apishim.common.ShimUtils;
+import com.android.networkstack.apishim.common.UnsupportedApiLevelException;
 import com.android.networkstack.metrics.DataStallDetectionStats;
 import com.android.networkstack.metrics.DataStallStatsUtils;
 import com.android.networkstack.netlink.TcpSocketTracker;
@@ -170,6 +178,7 @@ import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.InterruptedIOException;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.MalformedURLException;
@@ -196,6 +205,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -219,6 +229,7 @@ public class NetworkMonitor extends StateMachine {
 
     private static final int SOCKET_TIMEOUT_MS = 10000;
     private static final int PROBE_TIMEOUT_MS  = 3000;
+    private static final long TEST_URL_EXPIRATION_MS = TimeUnit.MINUTES.toMillis(10);
 
     private static final int UNSET_MCC_OR_MNC = -1;
 
@@ -359,9 +370,27 @@ public class NetworkMonitor extends StateMachine {
      * Message to self to poll current tcp status from kernel.
      */
     private static final int EVENT_POLL_TCPINFO = 21;
+
+    /**
+     * Message to self to do the bandwidth check in EvaluatingBandwidthState.
+     */
+    private static final int CMD_EVALUATE_BANDWIDTH = 22;
+
+    /**
+     * Message to self to know the bandwidth check is completed.
+     */
+    private static final int CMD_BANDWIDTH_CHECK_COMPLETE = 23;
+
+    /**
+     * Message to self to know the bandwidth check is timeouted.
+     */
+    private static final int CMD_BANDWIDTH_CHECK_TIMEOUT = 24;
+
     // Start mReevaluateDelayMs at this value and double.
     private static final int INITIAL_REEVALUATE_DELAY_MS = 1000;
     private static final int MAX_REEVALUATE_DELAY_MS = 10 * 60 * 1000;
+    // Default timeout of evaluating network bandwidth.
+    private static final int DEFAULT_EVALUATING_BANDWIDTH_TIMEOUT_MS = 10_000;
     // Before network has been evaluated this many times, ignore repeated reevaluate requests.
     private static final int IGNORE_REEVALUATE_ATTEMPTS = 5;
     private int mReevaluateToken = 0;
@@ -401,6 +430,12 @@ public class NetworkMonitor extends StateMachine {
     private final URL[] mCaptivePortalHttpsUrls;
     @Nullable
     private final CaptivePortalProbeSpec[] mCaptivePortalFallbackSpecs;
+    // Configuration values for network bandwidth check.
+    @Nullable
+    private final String mEvaluatingBandwidthUrl;
+    private final int mMaxRetryTimerMs;
+    private final int mEvaluatingBandwidthTimeoutMs;
+    private final AtomicInteger mNextEvaluatingBandwidthThreadId = new AtomicInteger(1);
 
     private NetworkCapabilities mNetworkCapabilities;
     private LinkProperties mLinkProperties;
@@ -416,6 +451,10 @@ public class NetworkMonitor extends StateMachine {
     private boolean mUserDoesNotWant = false;
     // Avoids surfacing "Sign in to network" notification.
     private boolean mDontDisplaySigninNotification = false;
+    // Set to true once the evaluating network bandwidth is passed or the captive portal respond
+    // APP_RETURN_WANTED_AS_IS which means the user wants to use this network anyway.
+    @VisibleForTesting
+    protected boolean mIsBandwidthCheckPassedOrIgnored = false;
 
     private final State mDefaultState = new DefaultState();
     private final State mValidatedState = new ValidatedState();
@@ -425,6 +464,7 @@ public class NetworkMonitor extends StateMachine {
     private final State mEvaluatingPrivateDnsState = new EvaluatingPrivateDnsState();
     private final State mProbingState = new ProbingState();
     private final State mWaitingForNextProbeState = new WaitingForNextProbeState();
+    private final State mEvaluatingBandwidthState = new EvaluatingBandwidthState();
 
     private CustomIntentReceiver mLaunchCaptivePortalAppBroadcastReceiver = null;
 
@@ -451,8 +491,8 @@ public class NetworkMonitor extends StateMachine {
     @Nullable
     private final DnsStallDetector mDnsStallDetector;
     private long mLastProbeTime;
-    // Set to true if data stall is suspected and reset to false after metrics are sent to statsd.
-    private boolean mCollectDataStallMetrics;
+    // The signal causing a data stall to be suspected. Reset to 0 after metrics are sent to statsd.
+    private @EvaluationType int mDataStallTypeToCollect;
     private boolean mAcceptPartialConnectivity = false;
     private final EvaluationState mEvaluationState = new EvaluationState();
 
@@ -514,6 +554,7 @@ public class NetworkMonitor extends StateMachine {
                 addState(mWaitingForNextProbeState, mEvaluatingState);
             addState(mCaptivePortalState, mMaybeNotifyState);
         addState(mEvaluatingPrivateDnsState, mDefaultState);
+        addState(mEvaluatingBandwidthState, mDefaultState);
         addState(mValidatedState, mDefaultState);
         setInitialState(mDefaultState);
         // CHECKSTYLE:ON IndentationCheck
@@ -535,6 +576,15 @@ public class NetworkMonitor extends StateMachine {
         mDnsStallDetector = initDnsStallDetectorIfRequired(mDataStallEvaluationType,
                 mConsecutiveDnsTimeoutThreshold);
         mTcpTracker = tst;
+        // Read the configurations of evaluating network bandwidth.
+        mEvaluatingBandwidthUrl = getResStringConfig(mContext,
+                R.string.config_evaluating_bandwidth_url, null);
+        mMaxRetryTimerMs = getResIntConfig(mContext,
+                R.integer.config_evaluating_bandwidth_max_retry_timer_ms,
+                MAX_REEVALUATE_DELAY_MS);
+        mEvaluatingBandwidthTimeoutMs = getResIntConfig(mContext,
+                R.integer.config_evaluating_bandwidth_timeout_ms,
+                DEFAULT_EVALUATING_BANDWIDTH_TIMEOUT_MS);
 
         // Provide empty LinkProperties and NetworkCapabilities to make sure they are never null,
         // even before notifyNetworkConnected.
@@ -772,6 +822,9 @@ public class NetworkMonitor extends StateMachine {
                             break;
                         case APP_RETURN_WANTED_AS_IS:
                             mDontDisplaySigninNotification = true;
+                            // If the user wants to use this network anyway, there is no need to
+                            // perform the bandwidth check even if configured.
+                            mIsBandwidthCheckPassedOrIgnored = true;
                             // TODO: Distinguish this from a network that actually validates.
                             // Displaying the "x" on the system UI icon may still be a good idea.
                             transitionTo(mEvaluatingPrivateDnsState);
@@ -926,8 +979,6 @@ public class NetworkMonitor extends StateMachine {
 
         boolean evaluateDataStall() {
             if (isDataStall()) {
-                // TODO: Add tcp info into metrics.
-                mCollectDataStallMetrics = true;
                 validationLog("Suspecting data stall, reevaluate");
                 return true;
             }
@@ -948,7 +999,8 @@ public class NetworkMonitor extends StateMachine {
         }
     }
 
-    private void writeDataStallStats(@NonNull final CaptivePortalProbeResult result) {
+    private void maybeWriteDataStallStats(@NonNull final CaptivePortalProbeResult result) {
+        if (mDataStallTypeToCollect == DATA_STALL_EVALUATION_TYPE_NONE) return;
         /*
          * Collect data stall detection level information for each transport type. Collect type
          * specific information for cellular and wifi only currently. Generate
@@ -956,19 +1008,22 @@ public class NetworkMonitor extends StateMachine {
          * TRANSPORT_WIFI and TRANSPORT_VPN, two DataStallDetectionStats will be generated.
          */
         final int[] transports = mNetworkCapabilities.getTransportTypes();
-
         for (int i = 0; i < transports.length; i++) {
-            final DataStallDetectionStats stats = buildDataStallDetectionStats(transports[i]);
+            final DataStallDetectionStats stats =
+                    buildDataStallDetectionStats(transports[i], mDataStallTypeToCollect);
             mDependencies.writeDataStallDetectionStats(stats, result);
         }
-        mCollectDataStallMetrics = false;
+        mDataStallTypeToCollect = DATA_STALL_EVALUATION_TYPE_NONE;
     }
 
     @VisibleForTesting
-    protected DataStallDetectionStats buildDataStallDetectionStats(int transport) {
+    protected DataStallDetectionStats buildDataStallDetectionStats(int transport,
+            @EvaluationType int evaluationType) {
         final DataStallDetectionStats.Builder stats = new DataStallDetectionStats.Builder();
-        if (VDBG_STALL) log("collectDataStallMetrics: type=" + transport);
-        stats.setEvaluationType(DATA_STALL_EVALUATION_TYPE_DNS);
+        if (VDBG_STALL) {
+            log("collectDataStallMetrics: type=" + transport + ", evaluation=" + evaluationType);
+        }
+        stats.setEvaluationType(evaluationType);
         stats.setNetworkType(transport);
         switch (transport) {
             case NetworkCapabilities.TRANSPORT_WIFI:
@@ -993,9 +1048,19 @@ public class NetworkMonitor extends StateMachine {
                 // No transport type specific information for the other types.
                 break;
         }
+
         addDnsEvents(stats);
+        addTcpStats(stats);
 
         return stats.build();
+    }
+
+    private void addTcpStats(@NonNull final DataStallDetectionStats.Builder stats) {
+        final TcpSocketTracker tst = getTcpSocketTracker();
+        if (tst == null) return;
+
+        stats.setTcpSentSinceLastRecv(tst.getSentSinceLastRecv());
+        stats.setTcpFailRate(tst.getLatestPacketFailPercentage());
     }
 
     @VisibleForTesting
@@ -1265,8 +1330,12 @@ public class NetworkMonitor extends StateMachine {
                         mEvaluationState.removeProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS);
                     }
 
-                    // All good!
-                    transitionTo(mValidatedState);
+                    if (needEvaluatingBandwidth()) {
+                        transitionTo(mEvaluatingBandwidthState);
+                    } else {
+                        // All good!
+                        transitionTo(mValidatedState);
+                    }
                     break;
                 case CMD_PRIVATE_DNS_SETTINGS_CHANGED:
                     // When settings change the reevaluation timer must be reset.
@@ -1343,11 +1412,11 @@ public class NetworkMonitor extends StateMachine {
                 time = watch.stop();
                 final String strIps = Arrays.toString(ips);
                 success = (ips != null && ips.length > 0);
-                validationLog(PROBE_PRIVDNS, host, String.format("%dms: %s", time, strIps));
+                validationLog(PROBE_PRIVDNS, host, String.format("%dus: %s", time, strIps));
             } catch (UnknownHostException uhe) {
                 time = watch.stop();
                 validationLog(PROBE_PRIVDNS, host,
-                        String.format("%dms - Error: %s", time, uhe.getMessage()));
+                        String.format("%dus - Error: %s", time, uhe.getMessage()));
             }
             logValidationProbe(time, PROBE_PRIVDNS, success ? DNS_SUCCESS : DNS_FAILURE);
             return success;
@@ -1383,9 +1452,7 @@ public class NetworkMonitor extends StateMachine {
                             (CaptivePortalProbeResult) message.obj;
                     mLastProbeTime = SystemClock.elapsedRealtime();
 
-                    if (mCollectDataStallMetrics) {
-                        writeDataStallStats(probeResult);
-                    }
+                    maybeWriteDataStallStats(probeResult);
 
                     if (probeResult.isSuccessful()) {
                         // Transit EvaluatingPrivateDnsState to get to Validated
@@ -1459,6 +1526,112 @@ public class NetworkMonitor extends StateMachine {
         }
     }
 
+    private final class EvaluatingBandwidthThread extends Thread {
+        final int mThreadId;
+
+        EvaluatingBandwidthThread(int id) {
+            mThreadId = id;
+        }
+
+        @Override
+        public void run() {
+            HttpURLConnection urlConnection = null;
+            try {
+                final URL url = makeURL(mEvaluatingBandwidthUrl);
+                urlConnection = makeProbeConnection(url, true /* followRedirects */);
+                // In order to exclude the time of DNS lookup, send the delay message of timeout
+                // here.
+                sendMessageDelayed(CMD_BANDWIDTH_CHECK_TIMEOUT, mEvaluatingBandwidthTimeoutMs);
+                readContentFromDownloadUrl(urlConnection);
+            } catch (InterruptedIOException e) {
+                // There is a timing issue that someone triggers the forcing reevaluation when
+                // executing the getInputStream(). The InterruptedIOException is thrown by
+                // Timeout#throwIfReached, it will reset the interrupt flag of Thread. So just
+                // return and wait for the bandwidth reevaluation, otherwise the
+                // CMD_BANDWIDTH_CHECK_COMPLETE will be sent.
+                validationLog("The thread is interrupted when executing the getInputStream(),"
+                        + " return and wait for the bandwidth reevaluation");
+                return;
+            } catch (IOException e) {
+                validationLog("Evaluating bandwidth failed: " + e + ", if the thread is not"
+                        + " interrupted, transition to validated state directly to make sure user"
+                        + " can use wifi normally.");
+            } finally {
+                if (urlConnection != null) {
+                    urlConnection.disconnect();
+                }
+            }
+            // Don't send CMD_BANDWIDTH_CHECK_COMPLETE if the IO is interrupted or timeout.
+            // Only send CMD_BANDWIDTH_CHECK_COMPLETE when the download is finished normally.
+            // Add a serial number for CMD_BANDWIDTH_CHECK_COMPLETE to prevent handling the obsolete
+            // CMD_BANDWIDTH_CHECK_COMPLETE.
+            if (!isInterrupted()) sendMessage(CMD_BANDWIDTH_CHECK_COMPLETE, mThreadId);
+        }
+
+        private void readContentFromDownloadUrl(@NonNull final HttpURLConnection conn)
+                throws IOException {
+            final byte[] buffer = new byte[1000];
+            final InputStream is = conn.getInputStream();
+            while (!isInterrupted() && is.read(buffer) > 0) { /* read again */ }
+        }
+    }
+
+    private class EvaluatingBandwidthState extends State {
+        private EvaluatingBandwidthThread mEvaluatingBandwidthThread;
+        private int mRetryBandwidthDelayMs;
+        private int mCurrentThreadId;
+
+        @Override
+        public void enter() {
+            mRetryBandwidthDelayMs = getResIntConfig(mContext,
+                    R.integer.config_evaluating_bandwidth_min_retry_timer_ms,
+                    INITIAL_REEVALUATE_DELAY_MS);
+            sendMessage(CMD_EVALUATE_BANDWIDTH);
+        }
+
+        @Override
+        public boolean processMessage(Message msg) {
+            switch (msg.what) {
+                case CMD_EVALUATE_BANDWIDTH:
+                    mCurrentThreadId = mNextEvaluatingBandwidthThreadId.getAndIncrement();
+                    mEvaluatingBandwidthThread = new EvaluatingBandwidthThread(mCurrentThreadId);
+                    mEvaluatingBandwidthThread.start();
+                    break;
+                case CMD_BANDWIDTH_CHECK_COMPLETE:
+                    // Only handle the CMD_BANDWIDTH_CHECK_COMPLETE which is sent by the newest
+                    // EvaluatingBandwidthThread.
+                    if (mCurrentThreadId == msg.arg1) {
+                        mIsBandwidthCheckPassedOrIgnored = true;
+                        transitionTo(mValidatedState);
+                    }
+                    break;
+                case CMD_BANDWIDTH_CHECK_TIMEOUT:
+                    validationLog("Evaluating bandwidth timeout!");
+                    mEvaluatingBandwidthThread.interrupt();
+                    scheduleReevaluatingBandwidth();
+                    break;
+                default:
+                    return NOT_HANDLED;
+            }
+            return HANDLED;
+        }
+
+        private void scheduleReevaluatingBandwidth() {
+            sendMessageDelayed(obtainMessage(CMD_EVALUATE_BANDWIDTH), mRetryBandwidthDelayMs);
+            mRetryBandwidthDelayMs *= 2;
+            if (mRetryBandwidthDelayMs > mMaxRetryTimerMs) {
+                mRetryBandwidthDelayMs = mMaxRetryTimerMs;
+            }
+        }
+
+        @Override
+        public void exit() {
+            mEvaluatingBandwidthThread.interrupt();
+            removeMessages(CMD_EVALUATE_BANDWIDTH);
+            removeMessages(CMD_BANDWIDTH_CHECK_TIMEOUT);
+        }
+    }
+
     // Limits the list of IP addresses returned by getAllByName or tried by openConnection to at
     // most one per address family. This ensures we only wait up to 20 seconds for TCP connections
     // to complete, regardless of how many IP addresses a host has.
@@ -1483,6 +1656,25 @@ public class NetworkMonitor extends StateMachine {
 
             return addressByFamily.values().toArray(new InetAddress[addressByFamily.size()]);
         }
+    }
+
+    @VisibleForTesting
+    boolean onlyWifiTransport() {
+        int[] transportTypes = mNetworkCapabilities.getTransportTypes();
+        return transportTypes.length == 1
+                && transportTypes[0] == NetworkCapabilities.TRANSPORT_WIFI;
+    }
+
+    @VisibleForTesting
+    boolean needEvaluatingBandwidth() {
+        if (mIsBandwidthCheckPassedOrIgnored
+                || TextUtils.isEmpty(mEvaluatingBandwidthUrl)
+                || !mNetworkCapabilities.hasCapability(NET_CAPABILITY_NOT_METERED)
+                || !onlyWifiTransport()) {
+            return false;
+        }
+
+        return true;
     }
 
     private boolean getIsCaptivePortalCheckEnabled() {
@@ -1598,22 +1790,57 @@ public class NetworkMonitor extends StateMachine {
         return getContextByMccMnc(Integer.parseInt(mcc), UNSET_MCC_OR_MNC);
     }
 
+    @Nullable
+    private String getTestUrl(@NonNull String key) {
+        final String strExpiration = mDependencies.getDeviceConfigProperty(NAMESPACE_CONNECTIVITY,
+                TEST_URL_EXPIRATION_TIME, null);
+        if (strExpiration == null) return null;
+
+        final long expTime;
+        try {
+            expTime = Long.parseUnsignedLong(strExpiration);
+        } catch (NumberFormatException e) {
+            loge("Invalid test URL expiration time format", e);
+            return null;
+        }
+
+        final long now = System.currentTimeMillis();
+        if (expTime < now || (expTime - now) > TEST_URL_EXPIRATION_MS) return null;
+
+        return mDependencies.getDeviceConfigProperty(NAMESPACE_CONNECTIVITY,
+                key, null /* defaultValue */);
+    }
+
     private String getCaptivePortalServerHttpsUrl() {
+        final String testUrl = getTestUrl(TEST_CAPTIVE_PORTAL_HTTPS_URL);
+        if (isValidTestUrl(testUrl)) return testUrl;
         final Context targetContext = getCustomizedContextOrDefault();
-        return getSettingFromResource(targetContext, R.string.config_captive_portal_https_url,
-                R.string.default_captive_portal_https_url, CAPTIVE_PORTAL_HTTPS_URL);
+        return getSettingFromResource(targetContext,
+                R.string.config_captive_portal_https_url, CAPTIVE_PORTAL_HTTPS_URL,
+                targetContext.getResources().getString(R.string.default_captive_portal_https_url));
+    }
+
+    private static boolean isValidTestUrl(@Nullable String url) {
+        if (TextUtils.isEmpty(url)) return false;
+
+        try {
+            // Only accept test URLs on localhost
+            return Uri.parse(url).getHost().equals("localhost");
+        } catch (Throwable e) {
+            Log.wtf(TAG, "Error parsing test URL", e);
+            return false;
+        }
     }
 
     private int getDnsProbeTimeout() {
         return getIntSetting(mContext, R.integer.config_captive_portal_dns_probe_timeout,
-                CONFIG_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT,
-                R.integer.default_captive_portal_dns_probe_timeout);
+                CONFIG_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT, DEFAULT_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT);
     }
 
     /**
      * Gets an integer setting from resources or device config
      *
-     * configResource is used if set, followed by device config if set, followed by defaultResource.
+     * configResource is used if set, followed by device config if set, followed by defaultValue.
      * If none of these are set then an exception is thrown.
      *
      * TODO: move to a common location such as a ConfigUtils class.
@@ -1621,13 +1848,13 @@ public class NetworkMonitor extends StateMachine {
      */
     @VisibleForTesting
     int getIntSetting(@NonNull final Context context, @StringRes int configResource,
-            @NonNull String symbol, @StringRes int defaultResource) {
+            @NonNull String symbol, int defaultValue) {
         final Resources res = context.getResources();
         try {
             return res.getInteger(configResource);
         } catch (Resources.NotFoundException e) {
             return mDependencies.getDeviceConfigPropertyInt(NAMESPACE_CONNECTIVITY,
-                    symbol, res.getInteger(defaultResource));
+                    symbol, defaultValue);
         }
     }
 
@@ -1678,9 +1905,12 @@ public class NetworkMonitor extends StateMachine {
      * on one URL that can be used, while NetworkMonitor may implement more complex logic.
      */
     public String getCaptivePortalServerHttpUrl() {
+        final String testUrl = getTestUrl(TEST_CAPTIVE_PORTAL_HTTP_URL);
+        if (isValidTestUrl(testUrl)) return testUrl;
         final Context targetContext = getCustomizedContextOrDefault();
-        return getSettingFromResource(targetContext, R.string.config_captive_portal_http_url,
-                R.string.default_captive_portal_http_url, CAPTIVE_PORTAL_HTTP_URL);
+        return getSettingFromResource(targetContext,
+                R.string.config_captive_portal_http_url, CAPTIVE_PORTAL_HTTP_URL,
+                targetContext.getResources().getString(R.string.default_captive_portal_http_url));
     }
 
     private int getConsecutiveDnsTimeoutThreshold() {
@@ -1701,7 +1931,8 @@ public class NetworkMonitor extends StateMachine {
                 DEFAULT_DATA_STALL_VALID_DNS_TIME_THRESHOLD_MS);
     }
 
-    private int getDataStallEvaluationType() {
+    @VisibleForTesting
+    int getDataStallEvaluationType() {
         return mDependencies.getDeviceConfigPropertyInt(NAMESPACE_CONNECTIVITY,
                 CONFIG_DATA_STALL_EVALUATION_TYPE,
                 DEFAULT_DATA_STALL_EVALUATION_TYPES);
@@ -1722,7 +1953,8 @@ public class NetworkMonitor extends StateMachine {
                 combineCaptivePortalUrls(firstUrl, CAPTIVE_PORTAL_OTHER_FALLBACK_URLS);
             return getProbeUrlArrayConfig(settingProviderUrls,
                     R.array.config_captive_portal_fallback_urls,
-                    R.array.default_captive_portal_fallback_urls, this::makeURL);
+                    R.array.default_captive_portal_fallback_urls,
+                    this::makeURL);
         } catch (Exception e) {
             // Don't let a misconfiguration bootloop the system.
             Log.e(TAG, "Error parsing configured fallback URLs", e);
@@ -1742,7 +1974,7 @@ public class NetworkMonitor extends StateMachine {
 
             return getProbeUrlArrayConfig(providerValue,
                     R.array.config_captive_portal_fallback_probe_specs,
-                    R.array.default_captive_portal_fallback_probe_specs,
+                    DEFAULT_CAPTIVE_PORTAL_FALLBACK_PROBE_SPECS,
                     CaptivePortalProbeSpec::parseSpecOrNull);
         } catch (Exception e) {
             // Don't let a misconfiguration bootloop the system.
@@ -1756,6 +1988,8 @@ public class NetworkMonitor extends StateMachine {
         try {
             final URL[] settingProviderUrls =
                 combineCaptivePortalUrls(firstUrl, CAPTIVE_PORTAL_OTHER_HTTPS_URLS);
+            // firstUrl will at least be default configuration, so default value in
+            // getProbeUrlArrayConfig is actually never used.
             return getProbeUrlArrayConfig(settingProviderUrls,
                     R.array.config_captive_portal_https_urls,
                     DEFAULT_CAPTIVE_PORTAL_HTTPS_URLS, this::makeURL);
@@ -1772,6 +2006,8 @@ public class NetworkMonitor extends StateMachine {
         try {
             final URL[] settingProviderUrls =
                     combineCaptivePortalUrls(firstUrl, CAPTIVE_PORTAL_OTHER_HTTP_URLS);
+            // firstUrl will at least be default configuration, so default value in
+            // getProbeUrlArrayConfig is actually never used.
             return getProbeUrlArrayConfig(settingProviderUrls,
                     R.array.config_captive_portal_http_urls,
                     DEFAULT_CAPTIVE_PORTAL_HTTP_URLS, this::makeURL);
@@ -1783,11 +2019,11 @@ public class NetworkMonitor extends StateMachine {
         }
     }
 
-    private URL[] combineCaptivePortalUrls(final String firstUrl, final String name) {
+    private URL[] combineCaptivePortalUrls(final String firstUrl, final String propertyName) {
         if (TextUtils.isEmpty(firstUrl)) return new URL[0];
 
         final String otherUrls = mDependencies.getDeviceConfigProperty(
-                NAMESPACE_CONNECTIVITY, name, "");
+                NAMESPACE_CONNECTIVITY, propertyName, "");
         // otherUrls may be empty, but .split() ignores trailing empty strings
         final String separator = ",";
         final String[] urls = (firstUrl + separator + otherUrls).split(separator);
@@ -1797,27 +2033,26 @@ public class NetworkMonitor extends StateMachine {
     /**
      * Read a setting from a resource or the settings provider.
      *
-     * <p>The configuration resource is prioritized, then the provider value, then the default
-     * resource value.
+     * <p>The configuration resource is prioritized, then the provider value.
      * @param context The context
      * @param configResource The resource id for the configuration parameter
-     * @param defaultResource The resource id for the default value
      * @param symbol The symbol in the settings provider
+     * @param defaultValue The default value
      * @return The best available value
      */
-    @NonNull
+    @Nullable
     private String getSettingFromResource(@NonNull final Context context,
-            @StringRes int configResource, @StringRes int defaultResource,
-            @NonNull String symbol) {
+            @StringRes int configResource, @NonNull String symbol, @NonNull String defaultValue) {
         final Resources res = context.getResources();
         String setting = res.getString(configResource);
 
         if (!TextUtils.isEmpty(setting)) return setting;
 
         setting = mDependencies.getSetting(context, symbol, null);
+
         if (!TextUtils.isEmpty(setting)) return setting;
 
-        return res.getString(defaultResource);
+        return defaultValue;
     }
 
     /**
@@ -2313,7 +2548,12 @@ public class NetworkMonitor extends StateMachine {
             final String apiContent;
             try {
                 final URL url = new URL(mCaptivePortalApiUrl.toString());
-                if (!"https".equals(url.getProtocol())) {
+                // Protocol must be HTTPS
+                // (as per https://www.ietf.org/id/draft-ietf-capport-api-07.txt, #4).
+                // Only allow HTTP on localhost, for testing.
+                final boolean isLocalhostHttp =
+                        "localhost".equals(url.getHost()) && "http".equals(url.getProtocol());
+                if (!"https".equals(url.getProtocol()) && !isLocalhostHttp) {
                     validationLog("Invalid captive portal API protocol: " + url.getProtocol());
                     return null;
                 }
@@ -2708,18 +2948,18 @@ public class NetworkMonitor extends StateMachine {
         if (mEvaluationTimer.isRunning()) {
             int[] transports = mNetworkCapabilities.getTransportTypes();
             mMetricsLog.log(mCleartextDnsNetwork, transports,
-                    new NetworkEvent(evtype, mEvaluationTimer.stop()));
+                    new NetworkEvent(evtype, mEvaluationTimer.stop() / 1000));
             mEvaluationTimer.reset();
         }
     }
 
-    private void logValidationProbe(long durationMs, int probeType, int probeResult) {
+    private void logValidationProbe(long durationUs, int probeType, int probeResult) {
         int[] transports = mNetworkCapabilities.getTransportTypes();
         boolean isFirstValidation = validationStage().mIsFirstValidation;
         ValidationProbeEvent ev = new ValidationProbeEvent.Builder()
                 .setProbeType(probeType, isFirstValidation)
                 .setReturnCode(probeResult)
-                .setDurationMs(durationMs)
+                .setDurationMs(durationUs / 1000)
                 .build();
         mMetricsLog.log(mCleartextDnsNetwork, transports, ev);
     }
@@ -2918,9 +3158,8 @@ public class NetworkMonitor extends StateMachine {
         return mDnsStallDetector;
     }
 
-    @VisibleForTesting
     @Nullable
-    protected TcpSocketTracker getTcpSocketTracker() {
+    private TcpSocketTracker getTcpSocketTracker() {
         return mTcpTracker;
     }
 
@@ -2957,6 +3196,7 @@ public class NetworkMonitor extends StateMachine {
                 result = false;
             } else if (tst.isDataStallSuspected()) {
                 result = true;
+                mDataStallTypeToCollect = DATA_STALL_EVALUATION_TYPE_TCP;
 
                 final DataStallReportParcelable p = new DataStallReportParcelable();
                 p.detectionMethod = DETECTION_METHOD_TCP_METRICS;
@@ -2981,6 +3221,7 @@ public class NetworkMonitor extends StateMachine {
             if (dsd.isDataStallSuspected(mConsecutiveDnsTimeoutThreshold,
                     mDataStallValidDnsTimeThreshold)) {
                 result = true;
+                mDataStallTypeToCollect = DATA_STALL_EVALUATION_TYPE_DNS;
                 logNetworkEvent(NetworkEvent.NETWORK_CONSECUTIVE_DNS_TIMEOUT_FOUND);
 
                 final DataStallReportParcelable p = new DataStallReportParcelable();
@@ -3152,8 +3393,7 @@ public class NetworkMonitor extends StateMachine {
                 CONFIG_DATA_STALL_EVALUATION_TYPE,
                 DEFAULT_DATA_STALL_EVALUATION_TYPES)
                 & DATA_STALL_EVALUATION_TYPE_TCP) != 0)
-                    ? new TcpSocketTracker(new TcpSocketTracker.Dependencies(context,
-                        ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q)), network)
+                    ? new TcpSocketTracker(new TcpSocketTracker.Dependencies(context), network)
                     : null;
     }
 
