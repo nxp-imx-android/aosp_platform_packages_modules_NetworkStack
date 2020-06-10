@@ -16,14 +16,30 @@
 
 package android.net.util;
 
+import android.annotation.IntDef;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+
 /**
  * Collection of utilities for data stall.
  */
 public class DataStallUtils {
+    public static final int DATA_STALL_EVALUATION_TYPE_NONE = 0;
     /** Detect data stall using dns timeout counts. */
     public static final int DATA_STALL_EVALUATION_TYPE_DNS = 1 << 0;
     /** Detect data stall using tcp connection fail rate. */
     public static final int DATA_STALL_EVALUATION_TYPE_TCP = 1 << 1;
+
+    @IntDef(prefix = { "DATA_STALL_EVALUATION_TYPE_" },
+        flag = true,
+        value = {
+            DATA_STALL_EVALUATION_TYPE_NONE,
+            DATA_STALL_EVALUATION_TYPE_DNS,
+            DATA_STALL_EVALUATION_TYPE_TCP, })
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface EvaluationType {
+    }
 
     // Default configuration values for data stall detection.
     public static final int DEFAULT_CONSECUTIVE_DNS_TIMEOUT_THRESHOLD = 5;
@@ -81,7 +97,7 @@ public class DataStallUtils {
     /**
      * Default polling interval to observe the tcp health.
      */
-    public static int DEFAULT_TCP_POLLING_INTERVAL_MS = 10_000;
+    public static int DEFAULT_TCP_POLLING_INTERVAL_MS = 20_000;
 
     /**
      * Default tcp packets fail rate to suspect as a data stall.

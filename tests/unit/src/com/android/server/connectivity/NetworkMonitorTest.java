@@ -27,6 +27,10 @@ import static android.net.INetworkMonitor.NETWORK_VALIDATION_PROBE_PRIVDNS;
 import static android.net.INetworkMonitor.NETWORK_VALIDATION_RESULT_PARTIAL;
 import static android.net.INetworkMonitor.NETWORK_VALIDATION_RESULT_VALID;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET;
+import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED;
+import static android.net.NetworkCapabilities.TRANSPORT_CELLULAR;
+import static android.net.NetworkCapabilities.TRANSPORT_VPN;
+import static android.net.NetworkCapabilities.TRANSPORT_WIFI;
 import static android.net.metrics.ValidationProbeEvent.PROBE_HTTP;
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_CONSECUTIVE_DNS_TIMEOUT_THRESHOLD;
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_EVALUATION_TYPE;
@@ -35,21 +39,20 @@ import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_TCP_POLLING_INTE
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_VALID_DNS_TIME_THRESHOLD;
 import static android.net.util.DataStallUtils.DATA_STALL_EVALUATION_TYPE_DNS;
 import static android.net.util.DataStallUtils.DATA_STALL_EVALUATION_TYPE_TCP;
+import static android.net.util.DataStallUtils.DEFAULT_DATA_STALL_EVALUATION_TYPES;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_FALLBACK_PROBE_SPECS;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_OTHER_FALLBACK_URLS;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_USE_HTTPS;
+import static android.net.util.NetworkStackUtils.DEFAULT_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT;
 import static android.net.util.NetworkStackUtils.DISMISS_PORTAL_IN_VALIDATED_NETWORK;
 import static android.net.util.NetworkStackUtils.DNS_PROBE_PRIVATE_IP_NO_INTERNET_VERSION;
+import static android.net.util.NetworkStackUtils.TEST_CAPTIVE_PORTAL_HTTPS_URL;
+import static android.net.util.NetworkStackUtils.TEST_CAPTIVE_PORTAL_HTTP_URL;
+import static android.net.util.NetworkStackUtils.TEST_URL_EXPIRATION_TIME;
+import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 
-import static com.android.networkstack.apishim.ConstantsShim.DETECTION_METHOD_DNS_EVENTS;
-import static com.android.networkstack.apishim.ConstantsShim.DETECTION_METHOD_TCP_METRICS;
-import static com.android.networkstack.apishim.ConstantsShim.KEY_DNS_CONSECUTIVE_TIMEOUTS;
-import static com.android.networkstack.apishim.ConstantsShim.KEY_NETWORK_PROBES_ATTEMPTED_BITMASK;
-import static com.android.networkstack.apishim.ConstantsShim.KEY_NETWORK_PROBES_SUCCEEDED_BITMASK;
-import static com.android.networkstack.apishim.ConstantsShim.KEY_NETWORK_VALIDATION_RESULT;
-import static com.android.networkstack.apishim.ConstantsShim.KEY_TCP_METRICS_COLLECTION_PERIOD_MILLIS;
-import static com.android.networkstack.apishim.ConstantsShim.KEY_TCP_PACKET_FAIL_RATE;
 import static com.android.networkstack.util.DnsUtils.PRIVATE_DNS_PROBE_HOST_SUFFIX;
+import static com.android.server.connectivity.NetworkMonitor.INITIAL_REEVALUATE_DELAY_MS;
 import static com.android.server.connectivity.NetworkMonitor.extractCharset;
 
 import static junit.framework.Assert.assertEquals;
@@ -64,16 +67,20 @@ import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
 import static org.mockito.ArgumentMatchers.anyBoolean;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.after;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyInt;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.atMost;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -93,6 +100,7 @@ import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.net.CaptivePortalData;
 import android.net.ConnectivityManager;
+import android.net.DataStallReportParcelable;
 import android.net.DnsResolver;
 import android.net.INetd;
 import android.net.INetworkMonitorCallbacks;
@@ -100,6 +108,7 @@ import android.net.InetAddresses;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
+import android.net.NetworkTestResultParcelable;
 import android.net.Uri;
 import android.net.captiveportal.CaptivePortalProbeResult;
 import android.net.metrics.IpConnectivityLog;
@@ -111,8 +120,8 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.ConditionVariable;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
-import android.os.PersistableBundle;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
@@ -132,19 +141,29 @@ import androidx.test.runner.AndroidJUnit4;
 import com.android.networkstack.NetworkStackNotifier;
 import com.android.networkstack.R;
 import com.android.networkstack.apishim.CaptivePortalDataShimImpl;
-import com.android.networkstack.apishim.ShimUtils;
+import com.android.networkstack.apishim.ConstantsShim;
+import com.android.networkstack.apishim.common.ShimUtils;
 import com.android.networkstack.metrics.DataStallDetectionStats;
 import com.android.networkstack.metrics.DataStallStatsUtils;
 import com.android.networkstack.netlink.TcpSocketTracker;
 import com.android.server.NetworkStackService.NetworkStackServiceManager;
+import com.android.server.connectivity.nano.CellularData;
+import com.android.server.connectivity.nano.DnsEvent;
+import com.android.server.connectivity.nano.WifiData;
+import com.android.testutils.DevSdkIgnoreRule;
+import com.android.testutils.DevSdkIgnoreRule.IgnoreUpTo;
 import com.android.testutils.HandlerUtilsKt;
+
+import com.google.protobuf.nano.MessageNano;
+
+import junit.framework.AssertionFailedError;
 
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
-import org.mockito.Captor;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.mockito.Spy;
@@ -169,8 +188,10 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Random;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLHandshakeException;
 
@@ -179,6 +200,9 @@ import javax.net.ssl.SSLHandshakeException;
 public class NetworkMonitorTest {
     private static final String LOCATION_HEADER = "location";
     private static final String CONTENT_TYPE_HEADER = "Content-Type";
+
+    @Rule
+    public final DevSdkIgnoreRule mIgnoreRule = new DevSdkIgnoreRule();
 
     private @Mock Context mContext;
     private @Mock Configuration mConfiguration;
@@ -199,15 +223,18 @@ public class NetworkMonitorTest {
     private @Mock HttpURLConnection mOtherHttpsConnection2;
     private @Mock HttpURLConnection mFallbackConnection;
     private @Mock HttpURLConnection mOtherFallbackConnection;
+    private @Mock HttpURLConnection mTestOverriddenUrlConnection;
     private @Mock HttpURLConnection mCapportApiConnection;
+    private @Mock HttpURLConnection mSpeedTestConnection;
     private @Mock Random mRandom;
     private @Mock NetworkMonitor.Dependencies mDependencies;
-    private @Mock INetworkMonitorCallbacks mCallbacks;
+    // Mockito can't create a mock of INetworkMonitorCallbacks on Q because it can't find
+    // CaptivePortalData on notifyCaptivePortalDataChanged. Use a spy on a mock IBinder instead.
+    private INetworkMonitorCallbacks mCallbacks = spy(
+            INetworkMonitorCallbacks.Stub.asInterface(mock(IBinder.class)));
     private @Spy Network mCleartextDnsNetwork = new Network(TEST_NETID);
     private @Mock Network mNetwork;
     private @Mock DataStallStatsUtils mDataStallStatsUtils;
-    private @Mock WifiInfo mWifiInfo;
-    private @Captor ArgumentCaptor<String> mNetworkTestedRedirectUrlCaptor;
     private @Mock TcpSocketTracker.Dependencies mTstDependencies;
     private @Mock INetd mNetd;
     private @Mock TcpSocketTracker mTst;
@@ -215,6 +242,7 @@ public class NetworkMonitorTest {
     private HashSet<BroadcastReceiver> mRegisteredReceivers;
     private @Mock Context mMccContext;
     private @Mock Resources mMccResource;
+    private @Mock WifiInfo mWifiInfo;
 
     private static final int TEST_NETID = 4242;
     private static final String TEST_HTTP_URL = "http://www.google.com/gen_204";
@@ -225,29 +253,24 @@ public class NetworkMonitorTest {
     private static final String TEST_HTTPS_OTHER_URL2 = "https://other2.google.com/gen_204";
     private static final String TEST_FALLBACK_URL = "http://fallback.google.com/gen_204";
     private static final String TEST_OTHER_FALLBACK_URL = "http://otherfallback.google.com/gen_204";
+    private static final String TEST_INVALID_OVERRIDE_URL = "https://override.example.com/test";
+    private static final String TEST_OVERRIDE_URL = "http://localhost:12345/test";
     private static final String TEST_CAPPORT_API_URL = "https://capport.example.com/api";
     private static final String TEST_LOGIN_URL = "https://testportal.example.com/login";
     private static final String TEST_VENUE_INFO_URL = "https://venue.example.com/info";
+    private static final String TEST_SPEED_TEST_URL = "https://speedtest.example.com";
+    private static final String TEST_RELATIVE_URL = "/test/relative/gen_204";
     private static final String TEST_MCCMNC = "123456";
-
     private static final String[] TEST_HTTP_URLS = {TEST_HTTP_OTHER_URL1, TEST_HTTP_OTHER_URL2};
     private static final String[] TEST_HTTPS_URLS = {TEST_HTTPS_OTHER_URL1, TEST_HTTPS_OTHER_URL2};
-
+    private static final int TEST_TCP_FAIL_RATE = 99;
+    private static final int TEST_TCP_PACKET_COUNT = 50;
+    private static final long TEST_ELAPSED_TIME_MS = 123456789L;
+    private static final int TEST_SIGNAL_STRENGTH = -100;
     private static final int VALIDATION_RESULT_INVALID = 0;
     private static final int VALIDATION_RESULT_PORTAL = 0;
     private static final String TEST_REDIRECT_URL = "android.com";
-    private static final int VALIDATION_RESULT_PARTIAL = NETWORK_VALIDATION_PROBE_DNS
-            | NETWORK_VALIDATION_PROBE_HTTP
-            | NETWORK_VALIDATION_RESULT_PARTIAL;
-    private static final int VALIDATION_RESULT_FALLBACK_PARTIAL = NETWORK_VALIDATION_PROBE_DNS
-            | NETWORK_VALIDATION_PROBE_FALLBACK
-            | NETWORK_VALIDATION_RESULT_PARTIAL;
-    private static final int VALIDATION_RESULT_VALID = NETWORK_VALIDATION_PROBE_DNS
-            | NETWORK_VALIDATION_PROBE_HTTPS
-            | NETWORK_VALIDATION_RESULT_VALID;
-    private static final int VALIDATION_RESULT_VALID_ALL_PROBES =
-            VALIDATION_RESULT_VALID | NETWORK_VALIDATION_PROBE_HTTP;
-    private static final int VALIDATION_RESULT_PRIVDNS_VALID = NETWORK_VALIDATION_PROBE_DNS
+    private static final int PROBES_PRIVDNS_VALID = NETWORK_VALIDATION_PROBE_DNS
             | NETWORK_VALIDATION_PROBE_HTTPS | NETWORK_VALIDATION_PROBE_PRIVDNS;
 
     private static final int RETURN_CODE_DNS_SUCCESS = 0;
@@ -257,28 +280,33 @@ public class NetworkMonitorTest {
     private static final int HANDLER_TIMEOUT_MS = 1000;
 
     private static final LinkProperties TEST_LINK_PROPERTIES = new LinkProperties();
-    private static final LinkProperties CAPPORT_LINK_PROPERTIES = makeCapportLinkProperties();
 
-    private static LinkProperties makeCapportLinkProperties() {
+    // Cannot have a static member for the LinkProperties with captive portal API information, as
+    // the initializer would crash on Q (the members in LinkProperties were introduced in R).
+    private static LinkProperties makeCapportLPs() {
         final LinkProperties lp = new LinkProperties(TEST_LINK_PROPERTIES);
         lp.setCaptivePortalApiUrl(Uri.parse(TEST_CAPPORT_API_URL));
         return lp;
     }
 
-    private static final NetworkCapabilities METERED_CAPABILITIES = new NetworkCapabilities()
+    private static final NetworkCapabilities CELL_METERED_CAPABILITIES = new NetworkCapabilities()
             .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
             .addCapability(NET_CAPABILITY_INTERNET);
 
-    private static final NetworkCapabilities NOT_METERED_CAPABILITIES = new NetworkCapabilities()
-            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
-            .addCapability(NET_CAPABILITY_INTERNET)
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED);
+    private static final NetworkCapabilities CELL_NOT_METERED_CAPABILITIES =
+            new NetworkCapabilities()
+                .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+                .addCapability(NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED);
 
-    private static final NetworkCapabilities NO_INTERNET_CAPABILITIES = new NetworkCapabilities()
-            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR);
+    private static final NetworkCapabilities WIFI_NOT_METERED_CAPABILITIES =
+            new NetworkCapabilities()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addCapability(NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED);
 
-    private static final int NOTIFY_NETWORK_TESTED_VALIDATION_RESULT_MASK = 0x3;
-    private static final int NOTIFY_NETWORK_TESTED_SUCCESSFUL_PROBES_MASK = 0xFFFC;
+    private static final NetworkCapabilities CELL_NO_INTERNET_CAPABILITIES =
+            new NetworkCapabilities().addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR);
 
     /**
      * Fakes DNS responses.
@@ -434,6 +462,10 @@ public class NetworkMonitorTest {
 
         when(mServiceManager.getNotifier()).thenReturn(mNotifier);
 
+        when(mTelephony.getDataNetworkType()).thenReturn(TelephonyManager.NETWORK_TYPE_LTE);
+        when(mTelephony.getNetworkOperator()).thenReturn(TEST_MCCMNC);
+        when(mTelephony.getSimOperator()).thenReturn(TEST_MCCMNC);
+
         when(mResources.getString(anyInt())).thenReturn("");
         when(mResources.getStringArray(anyInt())).thenReturn(new String[0]);
         doReturn(mConfiguration).when(mResources).getConfiguration();
@@ -469,8 +501,13 @@ public class NetworkMonitorTest {
                     return mFallbackConnection;
                 case TEST_OTHER_FALLBACK_URL:
                     return mOtherFallbackConnection;
+                case TEST_OVERRIDE_URL:
+                case TEST_INVALID_OVERRIDE_URL:
+                    return mTestOverriddenUrlConnection;
                 case TEST_CAPPORT_API_URL:
                     return mCapportApiConnection;
+                case TEST_SPEED_TEST_URL:
+                    return mSpeedTestConnection;
                 default:
                     fail("URL not mocked: " + url.toString());
                     return null;
@@ -534,11 +571,19 @@ public class NetworkMonitorTest {
     private void resetCallbacks(int interfaceVersion) {
         reset(mCallbacks);
         try {
-            when(mCallbacks.getInterfaceVersion()).thenReturn(interfaceVersion);
+            doReturn(interfaceVersion).when(mCallbacks).getInterfaceVersion();
         } catch (RemoteException e) {
             // Can't happen as mCallbacks is a mock
             fail("Error mocking getInterfaceVersion" + e);
         }
+    }
+
+    private TcpSocketTracker getTcpSocketTrackerOrNull(NetworkMonitor.Dependencies dp) {
+        return ((dp.getDeviceConfigPropertyInt(
+                NAMESPACE_CONNECTIVITY,
+                CONFIG_DATA_STALL_EVALUATION_TYPE,
+                DEFAULT_DATA_STALL_EVALUATION_TYPES)
+                & DATA_STALL_EVALUATION_TYPE_TCP) != 0) ? mTst : null;
     }
 
     private class WrappedNetworkMonitor extends NetworkMonitor {
@@ -547,7 +592,7 @@ public class NetworkMonitorTest {
 
         WrappedNetworkMonitor() {
             super(mContext, mCallbacks, mNetwork, mLogger, mValidationLogger, mServiceManager,
-                    mDependencies, mTst);
+                    mDependencies, getTcpSocketTrackerOrNull(mDependencies));
         }
 
         @Override
@@ -560,13 +605,10 @@ public class NetworkMonitorTest {
         }
 
         @Override
-        protected TcpSocketTracker getTcpSocketTracker() {
-            return mTst;
-        }
-
-        @Override
         protected void addDnsEvents(@NonNull final DataStallDetectionStats.Builder stats) {
-            generateTimeoutDnsEvent(stats, DEFAULT_DNS_TIMEOUT_THRESHOLD);
+            if ((getDataStallEvaluationType() & DATA_STALL_EVALUATION_TYPE_DNS) != 0) {
+                generateTimeoutDnsEvent(stats, DEFAULT_DNS_TIMEOUT_THRESHOLD);
+            }
         }
 
         @Override
@@ -596,13 +638,18 @@ public class NetworkMonitorTest {
         return nm;
     }
 
-    private WrappedNetworkMonitor makeMeteredNetworkMonitor() {
-        final WrappedNetworkMonitor nm = makeMonitor(METERED_CAPABILITIES);
+    private WrappedNetworkMonitor makeCellMeteredNetworkMonitor() {
+        final WrappedNetworkMonitor nm = makeMonitor(CELL_METERED_CAPABILITIES);
         return nm;
     }
 
-    private WrappedNetworkMonitor makeNotMeteredNetworkMonitor() {
-        final WrappedNetworkMonitor nm = makeMonitor(NOT_METERED_CAPABILITIES);
+    private WrappedNetworkMonitor makeCellNotMeteredNetworkMonitor() {
+        final WrappedNetworkMonitor nm = makeMonitor(CELL_NOT_METERED_CAPABILITIES);
+        return nm;
+    }
+
+    private WrappedNetworkMonitor makeWifiNotMeteredNetworkMonitor() {
+        final WrappedNetworkMonitor nm = makeMonitor(WIFI_NOT_METERED_CAPABILITIES);
         return nm;
     }
 
@@ -612,8 +659,104 @@ public class NetworkMonitorTest {
     }
 
     @Test
+    public void testOnlyWifiTransport() {
+        final WrappedNetworkMonitor wnm = makeMonitor(CELL_METERED_CAPABILITIES);
+        assertFalse(wnm.onlyWifiTransport());
+        final NetworkCapabilities nc = new NetworkCapabilities()
+                .addTransportType(TRANSPORT_WIFI)
+                .addTransportType(TRANSPORT_VPN);
+        setNetworkCapabilities(wnm, nc);
+        assertFalse(wnm.onlyWifiTransport());
+        nc.removeTransportType(TRANSPORT_VPN);
+        setNetworkCapabilities(wnm, nc);
+        assertTrue(wnm.onlyWifiTransport());
+    }
+
+    @Test
+    public void testNeedEvaluatingBandwidth() throws Exception {
+        // Make metered network first, the transport type is TRANSPORT_CELLULAR. That means the
+        // test cannot pass the condition check in needEvaluatingBandwidth().
+        final WrappedNetworkMonitor wnm1 = makeCellMeteredNetworkMonitor();
+        // Don't set the config_evaluating_bandwidth_url to make
+        // the condition check fail in needEvaluatingBandwidth().
+        assertFalse(wnm1.needEvaluatingBandwidth());
+        // Make the NetworkCapabilities to have the TRANSPORT_WIFI but it still cannot meet the
+        // condition check.
+        final NetworkCapabilities nc = new NetworkCapabilities()
+                .addTransportType(TRANSPORT_WIFI);
+        setNetworkCapabilities(wnm1, nc);
+        assertFalse(wnm1.needEvaluatingBandwidth());
+        // Make the network to be non-metered wifi but it still cannot meet the condition check
+        // since the config_evaluating_bandwidth_url is not set.
+        nc.addCapability(NET_CAPABILITY_NOT_METERED);
+        setNetworkCapabilities(wnm1, nc);
+        assertFalse(wnm1.needEvaluatingBandwidth());
+        // All configurations are set correctly.
+        doReturn(TEST_SPEED_TEST_URL).when(mResources).getString(
+                R.string.config_evaluating_bandwidth_url);
+        final WrappedNetworkMonitor wnm2 = makeCellMeteredNetworkMonitor();
+        setNetworkCapabilities(wnm2, nc);
+        assertTrue(wnm2.needEvaluatingBandwidth());
+        // Set mIsBandwidthCheckPassedOrIgnored to true and expect needEvaluatingBandwidth() will
+        // return false.
+        wnm2.mIsBandwidthCheckPassedOrIgnored = true;
+        assertFalse(wnm2.needEvaluatingBandwidth());
+        // Reset mIsBandwidthCheckPassedOrIgnored back to false.
+        wnm2.mIsBandwidthCheckPassedOrIgnored = false;
+        // Shouldn't evaluate network bandwidth on the metered wifi.
+        nc.removeCapability(NET_CAPABILITY_NOT_METERED);
+        setNetworkCapabilities(wnm2, nc);
+        assertFalse(wnm2.needEvaluatingBandwidth());
+        // Shouldn't evaluate network bandwidth on the unmetered cellular.
+        nc.addCapability(NET_CAPABILITY_NOT_METERED);
+        nc.removeTransportType(TRANSPORT_WIFI);
+        nc.addTransportType(TRANSPORT_CELLULAR);
+        assertFalse(wnm2.needEvaluatingBandwidth());
+    }
+
+    @Test
+    public void testEvaluatingBandwidthState_meteredNetwork() throws Exception {
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+        final NetworkCapabilities meteredCap = new NetworkCapabilities()
+                .addTransportType(TRANSPORT_WIFI)
+                .addCapability(NET_CAPABILITY_INTERNET);
+        doReturn(TEST_SPEED_TEST_URL).when(mResources).getString(
+                R.string.config_evaluating_bandwidth_url);
+        final NetworkMonitor nm = runNetworkTest(TEST_LINK_PROPERTIES, meteredCap,
+                NETWORK_VALIDATION_RESULT_VALID, NETWORK_VALIDATION_PROBE_DNS
+                | NETWORK_VALIDATION_PROBE_HTTPS, null /* redirectUrl */);
+        // Evaluating bandwidth process won't be executed when the network is metered wifi.
+        // Check that the connection hasn't been opened and the state should transition to validated
+        // state directly.
+        verify(mCleartextDnsNetwork, never()).openConnection(new URL(TEST_SPEED_TEST_URL));
+        assertEquals(NETWORK_VALIDATION_RESULT_VALID,
+                nm.getEvaluationState().getEvaluationResult());
+    }
+
+    @Test
+    public void testEvaluatingBandwidthState_nonMeteredNetworkWithWrongConfig() throws Exception {
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+        final NetworkCapabilities nonMeteredCap = new NetworkCapabilities()
+                .addTransportType(TRANSPORT_WIFI)
+                .addCapability(NET_CAPABILITY_INTERNET)
+                .addCapability(NET_CAPABILITY_NOT_METERED);
+        doReturn("").when(mResources).getString(R.string.config_evaluating_bandwidth_url);
+        final NetworkMonitor nm = runNetworkTest(TEST_LINK_PROPERTIES, nonMeteredCap,
+                NETWORK_VALIDATION_RESULT_VALID, NETWORK_VALIDATION_PROBE_DNS
+                | NETWORK_VALIDATION_PROBE_HTTPS, null /* redirectUrl */);
+        // Non-metered network with wrong configuration(the config_evaluating_bandwidth_url is
+        // empty). Check that the connection hasn't been opened and the state should transition to
+        // validated state directly.
+        verify(mCleartextDnsNetwork, never()).openConnection(new URL(TEST_SPEED_TEST_URL));
+        assertEquals(NETWORK_VALIDATION_RESULT_VALID,
+                nm.getEvaluationState().getEvaluationResult());
+    }
+
+    @Test
     public void testMatchesHttpContent() throws Exception {
-        final WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        final WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
         doReturn("[\\s\\S]*line2[\\s\\S]*").when(mResources).getString(
                 R.string.config_network_validation_failed_content_regexp);
         assertTrue(wnm.matchesHttpContent("This is line1\nThis is line2\nThis is line3",
@@ -630,7 +773,7 @@ public class NetworkMonitorTest {
 
     @Test
     public void testMatchesHttpContentLength() throws Exception {
-        final WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        final WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
         // Set the range of content length.
         doReturn(100).when(mResources).getInteger(R.integer.config_min_matches_http_content_length);
         doReturn(1000).when(mResources).getInteger(
@@ -657,7 +800,7 @@ public class NetworkMonitorTest {
 
     @Test
     public void testGetResStringConfig() throws Exception {
-        final WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        final WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
         // Set the config and expect to get the customized value.
         final String regExp = ".*HTTP.*200.*not a captive portal.*";
         doReturn(regExp).when(mResources).getString(
@@ -673,7 +816,7 @@ public class NetworkMonitorTest {
 
     @Test
     public void testGetResIntConfig() throws Exception {
-        final WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        final WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
         // Set the config and expect to get the customized value.
         doReturn(100).when(mResources).getInteger(R.integer.config_min_matches_http_content_length);
         doReturn(1000).when(mResources).getInteger(
@@ -695,20 +838,45 @@ public class NetworkMonitorTest {
     }
 
     @Test
+    public void testGetHttpProbeUrl() {
+        final WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        // If config_captive_portal_http_url is set and the global setting is set, the config is
+        // used.
+        doReturn(TEST_HTTP_URL).when(mResources).getString(R.string.config_captive_portal_http_url);
+        doReturn(TEST_HTTP_OTHER_URL2).when(mResources).getString(
+                R.string.default_captive_portal_http_url);
+        when(mDependencies.getSetting(any(), eq(Settings.Global.CAPTIVE_PORTAL_HTTP_URL), any()))
+                .thenReturn(TEST_HTTP_OTHER_URL1);
+        assertEquals(TEST_HTTP_URL, wnm.getCaptivePortalServerHttpUrl());
+        // If config_captive_portal_http_url is unset and the global setting is set, the global
+        // setting is used.
+        doReturn(null).when(mResources).getString(R.string.config_captive_portal_http_url);
+        assertEquals(TEST_HTTP_OTHER_URL1, wnm.getCaptivePortalServerHttpUrl());
+        // If both config_captive_portal_http_url and global setting are unset,
+        // default_captive_portal_http_url is used.
+        when(mDependencies.getSetting(any(), eq(Settings.Global.CAPTIVE_PORTAL_HTTP_URL), any()))
+                .thenReturn(null);
+        assertEquals(TEST_HTTP_OTHER_URL2, wnm.getCaptivePortalServerHttpUrl());
+    }
+
+    @Test
     public void testGetLocationMcc() throws Exception {
-        final WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        final WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
         doReturn(PackageManager.PERMISSION_DENIED).when(mContext).checkPermission(
                 eq(android.Manifest.permission.ACCESS_FINE_LOCATION),  anyInt(), anyInt());
         assertNull(wnm.getLocationMcc());
         doReturn(PackageManager.PERMISSION_GRANTED).when(mContext).checkPermission(
                 eq(android.Manifest.permission.ACCESS_FINE_LOCATION),  anyInt(), anyInt());
         doReturn(new ContextWrapper(mContext)).when(mContext).createConfigurationContext(any());
+        doReturn(null).when(mTelephony).getAllCellInfo();
+        assertNull(wnm.getLocationMcc());
         // Prepare CellInfo and check if the vote mechanism is working or not.
         final List<CellInfo> cellList = new ArrayList<CellInfo>();
+        doReturn(cellList).when(mTelephony).getAllCellInfo();
+        assertNull(wnm.getLocationMcc());
         cellList.add(makeTestCellInfoGsm("460"));
         cellList.add(makeTestCellInfoGsm("460"));
         cellList.add(makeTestCellInfoLte("466"));
-        doReturn(cellList).when(mTelephony).getAllCellInfo();
         // The count of 460 is 2 and the count of 466 is 1, so the getLocationMcc() should return
         // 460.
         assertEquals("460", wnm.getLocationMcc());
@@ -724,7 +892,7 @@ public class NetworkMonitorTest {
 
     @Test
     public void testGetMccMncOverrideInfo() {
-        final WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        final WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
         doReturn(new ContextWrapper(mContext)).when(mContext).createConfigurationContext(any());
         // 1839 is VZW's carrier id.
         doReturn(1839).when(mTelephony).getSimCarrierId();
@@ -761,7 +929,7 @@ public class NetworkMonitorTest {
 
     @Test
     public void testMakeFallbackUrls() throws Exception {
-        final WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        final WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
         // Value exist in setting provider.
         URL[] urls = wnm.makeCaptivePortalFallbackUrls();
         assertEquals(urls[0].toString(), TEST_FALLBACK_URL);
@@ -802,7 +970,7 @@ public class NetworkMonitorTest {
     private static CellIdentityGsm makeCellIdentityGsm(int lac, int cid, int arfcn, int bsic,
             String mccStr, String mncStr, String alphal, String alphas)
             throws ReflectiveOperationException {
-        if (ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q)) {
+        if (ShimUtils.isAtLeastR()) {
             return new CellIdentityGsm(lac, cid, arfcn, bsic, mccStr, mncStr, alphal, alphas,
                     Collections.emptyList() /* additionalPlmns */);
         } else {
@@ -817,7 +985,7 @@ public class NetworkMonitorTest {
     private static CellIdentityLte makeCellIdentityLte(int ci, int pci, int tac, int earfcn,
             int bandwidth, String mccStr, String mncStr, String alphal, String alphas)
             throws ReflectiveOperationException {
-        if (ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q)) {
+        if (ShimUtils.isAtLeastR()) {
             return new CellIdentityLte(ci, pci, tac, earfcn, new int[] {} /* bands */,
                     bandwidth, mccStr, mncStr, alphal, alphas,
                     Collections.emptyList() /* additionalPlmns */, null /* csgInfo */);
@@ -833,7 +1001,7 @@ public class NetworkMonitorTest {
 
     @Test
     public void testGetIntSetting() throws Exception {
-        WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
 
         // No config resource, no device config. Expect to get default resource.
         doThrow(new Resources.NotFoundException())
@@ -844,12 +1012,10 @@ public class NetworkMonitorTest {
         }).when(mDependencies).getDeviceConfigPropertyInt(any(),
                 eq(NetworkMonitor.CONFIG_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT),
                 anyInt());
-        when(mResources.getInteger(eq(R.integer.default_captive_portal_dns_probe_timeout)))
-                .thenReturn(42);
-        assertEquals(42, wnm.getIntSetting(mContext,
+        assertEquals(DEFAULT_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT, wnm.getIntSetting(mContext,
                 R.integer.config_captive_portal_dns_probe_timeout,
                 NetworkMonitor.CONFIG_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT,
-                R.integer.default_captive_portal_dns_probe_timeout));
+                DEFAULT_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT));
 
         // Set device config. Expect to get device config.
         when(mDependencies.getDeviceConfigPropertyInt(any(),
@@ -858,7 +1024,7 @@ public class NetworkMonitorTest {
         assertEquals(1234, wnm.getIntSetting(mContext,
                 R.integer.config_captive_portal_dns_probe_timeout,
                 NetworkMonitor.CONFIG_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT,
-                R.integer.default_captive_portal_dns_probe_timeout));
+                DEFAULT_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT));
 
         // Set config resource. Expect to get config resource.
         when(mResources.getInteger(eq(R.integer.config_captive_portal_dns_probe_timeout)))
@@ -866,14 +1032,14 @@ public class NetworkMonitorTest {
         assertEquals(5678, wnm.getIntSetting(mContext,
                 R.integer.config_captive_portal_dns_probe_timeout,
                 NetworkMonitor.CONFIG_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT,
-                R.integer.default_captive_portal_dns_probe_timeout));
+                DEFAULT_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT));
     }
 
     @Test
-    public void testIsCaptivePortal_HttpProbeIsPortal() throws IOException {
+    public void testIsCaptivePortal_HttpProbeIsPortal() throws Exception {
         setSslException(mHttpsConnection);
         setPortal302(mHttpConnection);
-        runPortalNetworkTest(VALIDATION_RESULT_PORTAL);
+        runPortalNetworkTest();
     }
 
     private void setupPrivateIpResponse(String privateAddr) throws Exception {
@@ -905,27 +1071,27 @@ public class NetworkMonitorTest {
     @Test
     public void testIsCaptivePortal_PrivateIpNotPortal_Disabled() throws Exception {
         setupPrivateIpResponse("192.168.1.1");
-        runPortalNetworkTest(VALIDATION_RESULT_PORTAL);
+        runPortalNetworkTest();
     }
 
     @Test
-    public void testIsCaptivePortal_HttpsProbeIsNotPortal() throws IOException {
+    public void testIsCaptivePortal_HttpsProbeIsNotPortal() throws Exception {
         setStatus(mHttpsConnection, 204);
         setStatus(mHttpConnection, 500);
 
-        runNotPortalNetworkTest();
+        runValidatedNetworkTest();
     }
 
     @Test
-    public void testIsCaptivePortal_FallbackProbeIsPortal() throws IOException {
+    public void testIsCaptivePortal_FallbackProbeIsPortal() throws Exception {
         setSslException(mHttpsConnection);
         setStatus(mHttpConnection, 500);
         setPortal302(mFallbackConnection);
-        runPortalNetworkTest(VALIDATION_RESULT_INVALID);
+        runPortalNetworkTest();
     }
 
     @Test
-    public void testIsCaptivePortal_FallbackProbeIsNotPortal() throws IOException {
+    public void testIsCaptivePortal_FallbackProbeIsNotPortal() throws Exception {
         setSslException(mHttpsConnection);
         setStatus(mHttpConnection, 500);
         setStatus(mFallbackConnection, 500);
@@ -935,7 +1101,7 @@ public class NetworkMonitorTest {
     }
 
     @Test
-    public void testIsCaptivePortal_OtherFallbackProbeIsPortal() throws IOException {
+    public void testIsCaptivePortal_OtherFallbackProbeIsPortal() throws Exception {
         // Set all fallback probes but one to invalid URLs to verify they are being skipped
         setFallbackUrl(TEST_FALLBACK_URL);
         setOtherFallbackUrls(TEST_FALLBACK_URL + "," + TEST_OTHER_FALLBACK_URL);
@@ -949,19 +1115,22 @@ public class NetworkMonitorTest {
         when(mRandom.nextInt()).thenReturn(2);
 
         // First check always uses the first fallback URL: inconclusive
-        final NetworkMonitor monitor = runNetworkTest(VALIDATION_RESULT_INVALID);
-        assertNull(mNetworkTestedRedirectUrlCaptor.getValue());
+        final NetworkMonitor monitor = runFailedNetworkTest();
         verify(mFallbackConnection, times(1)).getResponseCode();
         verify(mOtherFallbackConnection, never()).getResponseCode();
 
-        // Second check uses the URL chosen by Random
-        final CaptivePortalProbeResult result = monitor.isCaptivePortal();
-        assertTrue(result.isPortal());
-        verify(mOtherFallbackConnection, times(1)).getResponseCode();
+        // Second check should be triggered automatically after the reevaluate delay, and uses the
+        // URL chosen by mRandom
+        // Ensure that the reevaluate delay is not changed to a large value, otherwise this test
+        // would block for too long and a different test strategy should be used.
+        assertTrue(INITIAL_REEVALUATE_DELAY_MS < 2000);
+        verify(mOtherFallbackConnection, timeout(INITIAL_REEVALUATE_DELAY_MS + HANDLER_TIMEOUT_MS))
+                .getResponseCode();
+        verifyNetworkTested(VALIDATION_RESULT_PORTAL, 0 /* probesSucceeded */, TEST_LOGIN_URL);
     }
 
     @Test
-    public void testIsCaptivePortal_AllProbesFailed() throws IOException {
+    public void testIsCaptivePortal_AllProbesFailed() throws Exception {
         setSslException(mHttpsConnection);
         setStatus(mHttpConnection, 500);
         setStatus(mFallbackConnection, 404);
@@ -972,20 +1141,42 @@ public class NetworkMonitorTest {
     }
 
     @Test
-    public void testIsCaptivePortal_InvalidUrlSkipped() throws IOException {
+    public void testIsCaptivePortal_InvalidUrlSkipped() throws Exception {
         setFallbackUrl("invalid");
         setOtherFallbackUrls("otherinvalid," + TEST_OTHER_FALLBACK_URL + ",yetanotherinvalid");
 
         setSslException(mHttpsConnection);
         setStatus(mHttpConnection, 500);
         setPortal302(mOtherFallbackConnection);
-        runPortalNetworkTest(VALIDATION_RESULT_INVALID);
+        runPortalNetworkTest();
         verify(mOtherFallbackConnection, times(1)).getResponseCode();
         verify(mFallbackConnection, never()).getResponseCode();
     }
 
     @Test
-    public void testIsCaptivePortal_CapportApiIsPortal() throws Exception {
+    public void testIsCaptivePortal_CapportApiIsPortalWithNullPortalUrl() throws Exception {
+        assumeTrue(CaptivePortalDataShimImpl.isSupported());
+        setSslException(mHttpsConnection);
+        final long bytesRemaining = 10_000L;
+        final long secondsRemaining = 500L;
+        // Set content without partal url.
+        setApiContent(mCapportApiConnection, "{'captive': true,"
+                + "'venue-info-url': '" + TEST_VENUE_INFO_URL + "',"
+                + "'bytes-remaining': " + bytesRemaining + ","
+                + "'seconds-remaining': " + secondsRemaining + "}");
+        setPortal302(mHttpConnection);
+
+        runNetworkTest(makeCapportLPs(), CELL_METERED_CAPABILITIES, VALIDATION_RESULT_PORTAL,
+                0 /* probesSucceeded*/, TEST_LOGIN_URL);
+
+        verify(mCapportApiConnection).getResponseCode();
+
+        verify(mHttpConnection, times(1)).getResponseCode();
+        verify(mCallbacks, never()).notifyCaptivePortalDataChanged(any());
+    }
+
+    @Test
+    public void testIsCaptivePortal_CapportApiIsPortalWithValidPortalUrl() throws Exception {
         assumeTrue(CaptivePortalDataShimImpl.isSupported());
         setSslException(mHttpsConnection);
         final long bytesRemaining = 10_000L;
@@ -997,11 +1188,11 @@ public class NetworkMonitorTest {
                 + "'bytes-remaining': " + bytesRemaining + ","
                 + "'seconds-remaining': " + secondsRemaining + "}");
 
-        runNetworkTest(CAPPORT_LINK_PROPERTIES, METERED_CAPABILITIES, VALIDATION_RESULT_PORTAL);
+        runNetworkTest(makeCapportLPs(), CELL_METERED_CAPABILITIES, VALIDATION_RESULT_PORTAL,
+                0 /* probesSucceeded*/, TEST_LOGIN_URL);
 
         verify(mHttpConnection, never()).getResponseCode();
         verify(mCapportApiConnection).getResponseCode();
-        assertNotNull(mNetworkTestedRedirectUrlCaptor.getValue());
 
         final ArgumentCaptor<CaptivePortalData> capportDataCaptor =
                 ArgumentCaptor.forClass(CaptivePortalData.class);
@@ -1020,20 +1211,49 @@ public class NetworkMonitorTest {
     @Test
     public void testIsCaptivePortal_CapportApiRevalidation() throws Exception {
         assumeTrue(CaptivePortalDataShimImpl.isSupported());
+        setValidProbes();
         final NetworkMonitor nm = runValidatedNetworkTest();
 
         setApiContent(mCapportApiConnection, "{'captive': true, "
                 + "'user-portal-url': '" + TEST_LOGIN_URL + "'}");
-        nm.notifyLinkPropertiesChanged(CAPPORT_LINK_PROPERTIES);
+        nm.notifyLinkPropertiesChanged(makeCapportLPs());
 
-        verifyNetworkTested(VALIDATION_RESULT_PORTAL);
-        verify(mCallbacks).notifyCaptivePortalDataChanged(
-                argThat(data -> Uri.parse(TEST_LOGIN_URL).equals(data.getUserPortalUrl())));
-        assertEquals(TEST_LOGIN_URL, mNetworkTestedRedirectUrlCaptor.getValue());
+        verifyNetworkTested(VALIDATION_RESULT_PORTAL, 0 /* probesSucceeded */,
+                TEST_LOGIN_URL);
+        final ArgumentCaptor<CaptivePortalData> capportCaptor = ArgumentCaptor.forClass(
+                CaptivePortalData.class);
+        verify(mCallbacks).notifyCaptivePortalDataChanged(capportCaptor.capture());
+        assertEquals(Uri.parse(TEST_LOGIN_URL), capportCaptor.getValue().getUserPortalUrl());
 
         // HTTP probe was sent on first validation but not re-sent when there was a portal URL.
         verify(mHttpConnection, times(1)).getResponseCode();
         verify(mCapportApiConnection, times(1)).getResponseCode();
+    }
+
+    @Test
+    public void testIsCaptivePortal_NoRevalidationBeforeNetworkConnected() throws Exception {
+        assumeTrue(CaptivePortalDataShimImpl.isSupported());
+
+        final NetworkMonitor nm = makeCellMeteredNetworkMonitor();
+
+        final LinkProperties lp = makeCapportLPs();
+
+        // LinkProperties changed, but NM should not revalidate before notifyNetworkConnected
+        nm.notifyLinkPropertiesChanged(lp);
+        verify(mHttpConnection, after(100).never()).getResponseCode();
+        verify(mHttpsConnection, never()).getResponseCode();
+        verify(mCapportApiConnection, never()).getResponseCode();
+
+        setValidProbes();
+        setApiContent(mCapportApiConnection, "{'captive': true, "
+                + "'user-portal-url': '" + TEST_LOGIN_URL + "'}");
+
+        // After notifyNetworkConnected, validation uses the capport API contents
+        nm.notifyNetworkConnected(lp, CELL_METERED_CAPABILITIES);
+        verifyNetworkTested(VALIDATION_RESULT_PORTAL, 0 /* probesSucceeded */, TEST_LOGIN_URL);
+
+        verify(mHttpConnection, never()).getResponseCode();
+        verify(mCapportApiConnection).getResponseCode();
     }
 
     @Test
@@ -1043,10 +1263,13 @@ public class NetworkMonitorTest {
         setStatus(mHttpConnection, 500);
         setApiContent(mCapportApiConnection, "{'captive': false,"
                 + "'venue-info-url': '" + TEST_VENUE_INFO_URL + "'}");
-        runNetworkTest(CAPPORT_LINK_PROPERTIES, METERED_CAPABILITIES, VALIDATION_RESULT_INVALID);
+        runNetworkTest(makeCapportLPs(), CELL_METERED_CAPABILITIES, VALIDATION_RESULT_INVALID,
+                0 /* probesSucceeded */, null /* redirectUrl */);
 
-        verify(mCallbacks).notifyCaptivePortalDataChanged(argThat(data ->
-                Uri.parse(TEST_VENUE_INFO_URL).equals(data.getVenueInfoUrl())));
+        final ArgumentCaptor<CaptivePortalData> capportCaptor = ArgumentCaptor.forClass(
+                CaptivePortalData.class);
+        verify(mCallbacks).notifyCaptivePortalDataChanged(capportCaptor.capture());
+        assertEquals(Uri.parse(TEST_VENUE_INFO_URL), capportCaptor.getValue().getVenueInfoUrl());
     }
 
     @Test
@@ -1056,10 +1279,15 @@ public class NetworkMonitorTest {
         setStatus(mHttpConnection, 204);
         setApiContent(mCapportApiConnection, "{'captive': false,"
                 + "'venue-info-url': '" + TEST_VENUE_INFO_URL + "'}");
-        runNetworkTest(CAPPORT_LINK_PROPERTIES, METERED_CAPABILITIES, VALIDATION_RESULT_PARTIAL);
+        runNetworkTest(makeCapportLPs(), CELL_METERED_CAPABILITIES,
+                NETWORK_VALIDATION_RESULT_PARTIAL,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP,
+                null /* redirectUrl */);
 
-        verify(mCallbacks).notifyCaptivePortalDataChanged(argThat(data ->
-                Uri.parse(TEST_VENUE_INFO_URL).equals(data.getVenueInfoUrl())));
+        final ArgumentCaptor<CaptivePortalData> capportCaptor = ArgumentCaptor.forClass(
+                CaptivePortalData.class);
+        verify(mCallbacks).notifyCaptivePortalDataChanged(capportCaptor.capture());
+        assertEquals(Uri.parse(TEST_VENUE_INFO_URL), capportCaptor.getValue().getVenueInfoUrl());
     }
 
     @Test
@@ -1069,33 +1297,74 @@ public class NetworkMonitorTest {
         setStatus(mHttpConnection, 204);
         setApiContent(mCapportApiConnection, "{'captive': false,"
                 + "'venue-info-url': '" + TEST_VENUE_INFO_URL + "'}");
-        runNetworkTest(CAPPORT_LINK_PROPERTIES, METERED_CAPABILITIES,
-                VALIDATION_RESULT_VALID_ALL_PROBES);
+        runNetworkTest(makeCapportLPs(), CELL_METERED_CAPABILITIES,
+                NETWORK_VALIDATION_RESULT_VALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP
+                        | NETWORK_VALIDATION_PROBE_HTTPS,
+                null /* redirectUrl */);
 
-        verify(mCallbacks).notifyCaptivePortalDataChanged(argThat(data ->
-                Uri.parse(TEST_VENUE_INFO_URL).equals(data.getVenueInfoUrl())));
+        final ArgumentCaptor<CaptivePortalData> capportCaptor = ArgumentCaptor.forClass(
+                CaptivePortalData.class);
+        verify(mCallbacks).notifyCaptivePortalDataChanged(capportCaptor.capture());
+        assertEquals(Uri.parse(TEST_VENUE_INFO_URL), capportCaptor.getValue().getVenueInfoUrl());
     }
 
     @Test
     public void testIsCaptivePortal_CapportApiInvalidContent() throws Exception {
         assumeTrue(CaptivePortalDataShimImpl.isSupported());
-        setStatus(mHttpsConnection, 204);
+        setSslException(mHttpsConnection);
         setPortal302(mHttpConnection);
         setApiContent(mCapportApiConnection, "{SomeInvalidText");
-        runNetworkTest(CAPPORT_LINK_PROPERTIES, METERED_CAPABILITIES, VALIDATION_RESULT_PORTAL);
+        runNetworkTest(makeCapportLPs(), CELL_METERED_CAPABILITIES,
+                VALIDATION_RESULT_PORTAL, 0 /* probesSucceeded */,
+                TEST_LOGIN_URL);
 
         verify(mCallbacks, never()).notifyCaptivePortalDataChanged(any());
         verify(mHttpConnection).getResponseCode();
     }
 
+    private void runCapportApiInvalidUrlTest(String url) throws Exception {
+        assumeTrue(CaptivePortalDataShimImpl.isSupported());
+        setSslException(mHttpsConnection);
+        setPortal302(mHttpConnection);
+        final LinkProperties lp = new LinkProperties(TEST_LINK_PROPERTIES);
+        lp.setCaptivePortalApiUrl(Uri.parse(url));
+        runNetworkTest(makeCapportLPs(), CELL_METERED_CAPABILITIES,
+                VALIDATION_RESULT_PORTAL, 0 /* probesSucceeded */,
+                TEST_LOGIN_URL);
+
+        verify(mCallbacks, never()).notifyCaptivePortalDataChanged(any());
+        verify(mCapportApiConnection, never()).getInputStream();
+        verify(mHttpConnection).getResponseCode();
+    }
+
     @Test
+    public void testIsCaptivePortal_HttpIsInvalidCapportApiScheme() throws Exception {
+        runCapportApiInvalidUrlTest("http://capport.example.com");
+    }
+
+    @Test
+    public void testIsCaptivePortal_FileIsInvalidCapportApiScheme() throws Exception {
+        runCapportApiInvalidUrlTest("file://localhost/myfile");
+    }
+
+    @Test
+    public void testIsCaptivePortal_InvalidUrlFormat() throws Exception {
+        runCapportApiInvalidUrlTest("ThisIsNotAValidUrl");
+    }
+
+    @Test @IgnoreUpTo(Build.VERSION_CODES.Q)
     public void testIsCaptivePortal_CapportApiNotSupported() throws Exception {
+        // Test that on a R+ device, if NetworkStack was compiled without CaptivePortalData support
+        // (built against Q), NetworkMonitor behaves as expected.
         assumeFalse(CaptivePortalDataShimImpl.isSupported());
         setSslException(mHttpsConnection);
         setPortal302(mHttpConnection);
         setApiContent(mCapportApiConnection, "{'captive': false,"
                 + "'venue-info-url': '" + TEST_VENUE_INFO_URL + "'}");
-        runNetworkTest(CAPPORT_LINK_PROPERTIES, METERED_CAPABILITIES, VALIDATION_RESULT_PORTAL);
+        runNetworkTest(makeCapportLPs(), CELL_METERED_CAPABILITIES, VALIDATION_RESULT_PORTAL,
+                0 /* probesSucceeded */,
+                TEST_LOGIN_URL);
 
         verify(mCallbacks, never()).notifyCaptivePortalDataChanged(any());
         verify(mHttpConnection).getResponseCode();
@@ -1130,7 +1399,8 @@ public class NetworkMonitorTest {
                 R.integer.config_max_matches_http_content_length);
         doReturn("te.t").when(mResources).getString(
                 R.string.config_network_validation_success_content_regexp);
-        runPartialConnectivityNetworkTest(VALIDATION_RESULT_PARTIAL);
+        runPartialConnectivityNetworkTest(
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP);
     }
 
     private void setupFallbackSpec() throws IOException {
@@ -1146,25 +1416,26 @@ public class NetworkMonitorTest {
     }
 
     @Test
-    public void testIsCaptivePortal_FallbackSpecIsPartial() throws IOException {
+    public void testIsCaptivePortal_FallbackSpecIsPartial() throws Exception {
         setupFallbackSpec();
         set302(mOtherFallbackConnection, "https://www.google.com/test?q=3");
 
         // HTTPS failed, fallback spec went through -> partial connectivity
-        runPartialConnectivityNetworkTest(VALIDATION_RESULT_FALLBACK_PARTIAL);
+        runPartialConnectivityNetworkTest(
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_FALLBACK);
         verify(mOtherFallbackConnection, times(1)).getResponseCode();
         verify(mFallbackConnection, never()).getResponseCode();
     }
 
     @Test
-    public void testIsCaptivePortal_FallbackSpecIsPortal() throws IOException {
+    public void testIsCaptivePortal_FallbackSpecIsPortal() throws Exception {
         setupFallbackSpec();
-        set302(mOtherFallbackConnection, "http://login.portal.example.com");
-        runPortalNetworkTest(VALIDATION_RESULT_INVALID);
+        setPortal302(mOtherFallbackConnection);
+        runPortalNetworkTest();
     }
 
     @Test
-    public void testIsCaptivePortal_IgnorePortals() throws IOException {
+    public void testIsCaptivePortal_IgnorePortals() throws Exception {
         setCaptivePortalMode(Settings.Global.CAPTIVE_PORTAL_MODE_IGNORE);
         setSslException(mHttpsConnection);
         setPortal302(mHttpConnection);
@@ -1173,39 +1444,117 @@ public class NetworkMonitorTest {
     }
 
     @Test
+    public void testIsCaptivePortal_OverriddenHttpsUrlValid() throws Exception {
+        setDeviceConfig(TEST_URL_EXPIRATION_TIME,
+                String.valueOf(currentTimeMillis() + TimeUnit.MINUTES.toMillis(9)));
+        setDeviceConfig(TEST_CAPTIVE_PORTAL_HTTPS_URL, TEST_OVERRIDE_URL);
+        setStatus(mTestOverriddenUrlConnection, 204);
+        setStatus(mHttpConnection, 204);
+
+        runValidatedNetworkTest();
+        verify(mHttpsConnection, never()).getResponseCode();
+        verify(mTestOverriddenUrlConnection).getResponseCode();
+    }
+
+    @Test
+    public void testIsCaptivePortal_OverriddenHttpUrlPortal() throws Exception {
+        setDeviceConfig(TEST_URL_EXPIRATION_TIME,
+                String.valueOf(currentTimeMillis() + TimeUnit.MINUTES.toMillis(9)));
+        setDeviceConfig(TEST_CAPTIVE_PORTAL_HTTP_URL, TEST_OVERRIDE_URL);
+        setStatus(mHttpsConnection, 500);
+        setPortal302(mTestOverriddenUrlConnection);
+
+        runPortalNetworkTest();
+        verify(mHttpConnection, never()).getResponseCode();
+        verify(mTestOverriddenUrlConnection).getResponseCode();
+    }
+
+    @Test
+    public void testIsCaptivePortal_InvalidHttpOverrideUrl() throws Exception {
+        setDeviceConfig(TEST_URL_EXPIRATION_TIME,
+                String.valueOf(currentTimeMillis() + TimeUnit.MINUTES.toMillis(9)));
+        setDeviceConfig(TEST_CAPTIVE_PORTAL_HTTP_URL, TEST_INVALID_OVERRIDE_URL);
+        setStatus(mHttpsConnection, 500);
+        setPortal302(mHttpConnection);
+
+        runPortalNetworkTest();
+        verify(mTestOverriddenUrlConnection, never()).getResponseCode();
+        verify(mHttpConnection).getResponseCode();
+    }
+
+    @Test
+    public void testIsCaptivePortal_InvalidHttpsOverrideUrl() throws Exception {
+        setDeviceConfig(TEST_URL_EXPIRATION_TIME,
+                String.valueOf(currentTimeMillis() + TimeUnit.MINUTES.toMillis(9)));
+        setDeviceConfig(TEST_CAPTIVE_PORTAL_HTTPS_URL, TEST_INVALID_OVERRIDE_URL);
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+
+        runValidatedNetworkTest();
+        verify(mTestOverriddenUrlConnection, never()).getResponseCode();
+        verify(mHttpsConnection).getResponseCode();
+    }
+
+    @Test
+    public void testIsCaptivePortal_ExpiredHttpsOverrideUrl() throws Exception {
+        setDeviceConfig(TEST_URL_EXPIRATION_TIME,
+                String.valueOf(currentTimeMillis() - TimeUnit.MINUTES.toMillis(1)));
+        setDeviceConfig(TEST_CAPTIVE_PORTAL_HTTPS_URL, TEST_OVERRIDE_URL);
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+
+        runValidatedNetworkTest();
+        verify(mTestOverriddenUrlConnection, never()).getResponseCode();
+        verify(mHttpsConnection).getResponseCode();
+    }
+
+    @Test
+    public void testIsCaptivePortal_TestHttpUrlExpirationTooLarge() throws Exception {
+        setDeviceConfig(TEST_URL_EXPIRATION_TIME,
+                String.valueOf(currentTimeMillis() + TimeUnit.MINUTES.toMillis(20)));
+        setDeviceConfig(TEST_CAPTIVE_PORTAL_HTTP_URL, TEST_OVERRIDE_URL);
+        setStatus(mHttpsConnection, 500);
+        setPortal302(mHttpConnection);
+
+        runPortalNetworkTest();
+        verify(mTestOverriddenUrlConnection, never()).getResponseCode();
+        verify(mHttpConnection).getResponseCode();
+    }
+
+    @Test
     public void testIsDataStall_EvaluationDisabled() {
         setDataStallEvaluationType(0);
-        WrappedNetworkMonitor wrappedMonitor = makeMeteredNetworkMonitor();
+        WrappedNetworkMonitor wrappedMonitor = makeCellMeteredNetworkMonitor();
         wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 100);
         assertFalse(wrappedMonitor.isDataStall());
     }
 
     @Test
     public void testIsDataStall_EvaluationDnsOnNotMeteredNetwork() throws Exception {
-        WrappedNetworkMonitor wrappedMonitor = makeNotMeteredNetworkMonitor();
+        WrappedNetworkMonitor wrappedMonitor = makeCellNotMeteredNetworkMonitor();
         wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 100);
         makeDnsTimeoutEvent(wrappedMonitor, DEFAULT_DNS_TIMEOUT_THRESHOLD);
         assertTrue(wrappedMonitor.isDataStall());
-        verify(mCallbacks).notifyDataStallSuspected(anyLong(), eq(DETECTION_METHOD_DNS_EVENTS),
-                bundleForDnsDataStall(DEFAULT_DNS_TIMEOUT_THRESHOLD));
+        verify(mCallbacks).notifyDataStallSuspected(
+                matchDnsDataStallParcelable(DEFAULT_DNS_TIMEOUT_THRESHOLD));
     }
 
     @Test
     public void testIsDataStall_EvaluationDnsOnMeteredNetwork() throws Exception {
-        WrappedNetworkMonitor wrappedMonitor = makeMeteredNetworkMonitor();
+        WrappedNetworkMonitor wrappedMonitor = makeCellMeteredNetworkMonitor();
         wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 100);
         assertFalse(wrappedMonitor.isDataStall());
 
         wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
         makeDnsTimeoutEvent(wrappedMonitor, DEFAULT_DNS_TIMEOUT_THRESHOLD);
         assertTrue(wrappedMonitor.isDataStall());
-        verify(mCallbacks).notifyDataStallSuspected(anyLong(), eq(DETECTION_METHOD_DNS_EVENTS),
-                bundleForDnsDataStall(DEFAULT_DNS_TIMEOUT_THRESHOLD));
+        verify(mCallbacks).notifyDataStallSuspected(
+                matchDnsDataStallParcelable(DEFAULT_DNS_TIMEOUT_THRESHOLD));
     }
 
     @Test
     public void testIsDataStall_EvaluationDnsWithDnsTimeoutCount() throws Exception {
-        WrappedNetworkMonitor wrappedMonitor = makeMeteredNetworkMonitor();
+        WrappedNetworkMonitor wrappedMonitor = makeCellMeteredNetworkMonitor();
         wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
         makeDnsTimeoutEvent(wrappedMonitor, 3);
         assertFalse(wrappedMonitor.isDataStall());
@@ -1218,12 +1567,12 @@ public class NetworkMonitorTest {
         assertTrue(wrappedMonitor.isDataStall());
 
         // The expected timeout count is the previous 2 DNS timeouts + the most recent 3 timeouts
-        verify(mCallbacks).notifyDataStallSuspected(anyLong(), eq(DETECTION_METHOD_DNS_EVENTS),
-                bundleForDnsDataStall(5));
+        verify(mCallbacks).notifyDataStallSuspected(
+                matchDnsDataStallParcelable(5 /* timeoutCount */));
 
         // Set the value to larger than the default dns log size.
         setConsecutiveDnsTimeoutThreshold(51);
-        wrappedMonitor = makeMeteredNetworkMonitor();
+        wrappedMonitor = makeCellMeteredNetworkMonitor();
         wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
         makeDnsTimeoutEvent(wrappedMonitor, 50);
         assertFalse(wrappedMonitor.isDataStall());
@@ -1232,8 +1581,8 @@ public class NetworkMonitorTest {
         assertTrue(wrappedMonitor.isDataStall());
 
         // The expected timeout count is the previous 50 DNS timeouts + the most recent timeout
-        verify(mCallbacks).notifyDataStallSuspected(anyLong(), eq(DETECTION_METHOD_DNS_EVENTS),
-                bundleForDnsDataStall(51));
+        verify(mCallbacks).notifyDataStallSuspected(
+                matchDnsDataStallParcelable(51 /* timeoutCount */));
     }
 
     @Test
@@ -1243,7 +1592,7 @@ public class NetworkMonitorTest {
         when(mTstDependencies.isTcpInfoParsingSupported()).thenReturn(true);
         when(mTst.getLatestReceivedCount()).thenReturn(0);
         when(mTst.isDataStallSuspected()).thenReturn(true);
-        final WrappedNetworkMonitor nm = makeMonitor(NO_INTERNET_CAPABILITIES);
+        final WrappedNetworkMonitor nm = makeMonitor(CELL_NO_INTERNET_CAPABILITIES);
         nm.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
         makeDnsTimeoutEvent(nm, DEFAULT_DNS_TIMEOUT_THRESHOLD);
         assertFalse(nm.isDataStall());
@@ -1252,18 +1601,18 @@ public class NetworkMonitorTest {
     @Test
     public void testIsDataStall_EvaluationDnsWithDnsTimeThreshold() throws Exception {
         // Test dns events happened in valid dns time threshold.
-        WrappedNetworkMonitor wrappedMonitor = makeMeteredNetworkMonitor();
+        WrappedNetworkMonitor wrappedMonitor = makeCellMeteredNetworkMonitor();
         wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 100);
         makeDnsTimeoutEvent(wrappedMonitor, DEFAULT_DNS_TIMEOUT_THRESHOLD);
         assertFalse(wrappedMonitor.isDataStall());
         wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
         assertTrue(wrappedMonitor.isDataStall());
-        verify(mCallbacks).notifyDataStallSuspected(anyLong(), eq(DETECTION_METHOD_DNS_EVENTS),
-                bundleForDnsDataStall(DEFAULT_DNS_TIMEOUT_THRESHOLD));
+        verify(mCallbacks).notifyDataStallSuspected(
+                matchDnsDataStallParcelable(DEFAULT_DNS_TIMEOUT_THRESHOLD));
 
         // Test dns events happened before valid dns time threshold.
         setValidDataStallDnsTimeThreshold(0);
-        wrappedMonitor = makeMeteredNetworkMonitor();
+        wrappedMonitor = makeCellMeteredNetworkMonitor();
         wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 100);
         makeDnsTimeoutEvent(wrappedMonitor, DEFAULT_DNS_TIMEOUT_THRESHOLD);
         assertFalse(wrappedMonitor.isDataStall());
@@ -1275,7 +1624,7 @@ public class NetworkMonitorTest {
     public void testIsDataStall_EvaluationTcp() throws Exception {
         // Evaluate TCP only. Expect ignoring DNS signal.
         setDataStallEvaluationType(DATA_STALL_EVALUATION_TYPE_TCP);
-        WrappedNetworkMonitor wrappedMonitor = makeMonitor(METERED_CAPABILITIES);
+        WrappedNetworkMonitor wrappedMonitor = makeMonitor(CELL_METERED_CAPABILITIES);
         assertFalse(wrappedMonitor.isDataStall());
         // Packet received.
         when(mTstDependencies.isTcpInfoParsingSupported()).thenReturn(true);
@@ -1293,15 +1642,33 @@ public class NetworkMonitorTest {
         wrappedMonitor.sendTcpPollingEvent();
         HandlerUtilsKt.waitForIdle(wrappedMonitor.getHandler(), HANDLER_TIMEOUT_MS);
         assertTrue(wrappedMonitor.isDataStall());
-        verify(mCallbacks).notifyDataStallSuspected(anyLong(), eq(DETECTION_METHOD_TCP_METRICS),
-                bundleForTcpDataStall());
+        verify(mCallbacks).notifyDataStallSuspected(matchTcpDataStallParcelable());
+    }
+
+    @Test
+    public void testIsDataStall_EvaluationDnsAndTcp() throws Exception {
+        setDataStallEvaluationType(DATA_STALL_EVALUATION_TYPE_DNS | DATA_STALL_EVALUATION_TYPE_TCP);
+        setupTcpDataStall();
+        final WrappedNetworkMonitor nm = makeMonitor(CELL_METERED_CAPABILITIES);
+        nm.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
+        makeDnsTimeoutEvent(nm, DEFAULT_DNS_TIMEOUT_THRESHOLD);
+        assertTrue(nm.isDataStall());
+        verify(mCallbacks).notifyDataStallSuspected(
+                matchDnsAndTcpDataStallParcelable(DEFAULT_DNS_TIMEOUT_THRESHOLD));
+
+        when(mTst.getLatestReceivedCount()).thenReturn(5);
+        // Trigger a tcp event immediately.
+        setTcpPollingInterval(0);
+        nm.sendTcpPollingEvent();
+        HandlerUtilsKt.waitForIdle(nm.getHandler(), HANDLER_TIMEOUT_MS);
+        assertFalse(nm.isDataStall());
     }
 
     @Test
     public void testIsDataStall_DisableTcp() {
         // Disable tcp detection with only DNS detect. keep the tcp signal but set to no DNS signal.
         setDataStallEvaluationType(DATA_STALL_EVALUATION_TYPE_DNS);
-        WrappedNetworkMonitor wrappedMonitor = makeMonitor(METERED_CAPABILITIES);
+        WrappedNetworkMonitor wrappedMonitor = makeMonitor(CELL_METERED_CAPABILITIES);
         makeDnsSuccessEvent(wrappedMonitor, 1);
         wrappedMonitor.sendTcpPollingEvent();
         HandlerUtilsKt.waitForIdle(wrappedMonitor.getHandler(), HANDLER_TIMEOUT_MS);
@@ -1321,8 +1688,8 @@ public class NetworkMonitorTest {
 
     @Test
     public void testNoInternetCapabilityValidated() throws Exception {
-        runNetworkTest(TEST_LINK_PROPERTIES, NO_INTERNET_CAPABILITIES,
-                NETWORK_VALIDATION_RESULT_VALID);
+        runNetworkTest(TEST_LINK_PROPERTIES, CELL_NO_INTERNET_CAPABILITIES,
+                NETWORK_VALIDATION_RESULT_VALID, 0 /* probesSucceeded */, null /* redirectUrl */);
         verify(mCleartextDnsNetwork, never()).openConnection(any());
     }
 
@@ -1331,8 +1698,8 @@ public class NetworkMonitorTest {
         setSslException(mHttpsConnection);
         setPortal302(mHttpConnection);
         when(mHttpConnection.getHeaderField(eq("location"))).thenReturn(TEST_LOGIN_URL);
-        final NetworkMonitor nm = makeMonitor(METERED_CAPABILITIES);
-        notifyNetworkConnected(nm, METERED_CAPABILITIES);
+        final NetworkMonitor nm = makeMonitor(CELL_METERED_CAPABILITIES);
+        notifyNetworkConnected(nm, CELL_METERED_CAPABILITIES);
 
         verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1))
                 .showProvisioningNotification(any(), any());
@@ -1362,13 +1729,12 @@ public class NetworkMonitorTest {
         setStatus(mHttpsConnection, 204);
         setStatus(mHttpConnection, 204);
 
-        final int expectedResult = NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP
-                | NETWORK_VALIDATION_RESULT_VALID;
         resetCallbacks();
         nm.notifyCaptivePortalAppFinished(APP_RETURN_DISMISSED);
         verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).atLeastOnce())
-                .notifyNetworkTestedWithExtras(eq(expectedResult), any(), anyLong(),
-                        bundleForNotifyNetworkTested(expectedResult));
+                .notifyNetworkTestedWithExtras(matchNetworkTestResultParcelable(
+                        NETWORK_VALIDATION_RESULT_VALID,
+                        NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP));
         assertEquals(0, mRegisteredReceivers.size());
     }
 
@@ -1377,43 +1743,35 @@ public class NetworkMonitorTest {
         setStatus(mHttpsConnection, 204);
         setStatus(mHttpConnection, 204);
 
-        final int expectedResult = VALIDATION_RESULT_VALID | NETWORK_VALIDATION_PROBE_PRIVDNS;
-
         // Verify dns query only get v6 address.
         mFakeDns.setAnswer("dns6.google", new String[]{"2001:db8::53"}, TYPE_AAAA);
-        WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
         wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns6.google",
                 new InetAddress[0]));
-        notifyNetworkConnected(wnm, NOT_METERED_CAPABILITIES);
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1))
-                .notifyNetworkTestedWithExtras(eq(expectedResult), eq(null), anyLong(),
-                        bundleForNotifyNetworkTested(expectedResult));
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_VALID, PROBES_PRIVDNS_VALID);
         verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyProbeStatusChanged(
-                eq(VALIDATION_RESULT_PRIVDNS_VALID), eq(VALIDATION_RESULT_PRIVDNS_VALID));
+                eq(PROBES_PRIVDNS_VALID), eq(PROBES_PRIVDNS_VALID));
 
         // Verify dns query only get v4 address.
         resetCallbacks();
         mFakeDns.setAnswer("dns4.google", new String[]{"192.0.2.1"}, TYPE_A);
         wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns4.google",
                 new InetAddress[0]));
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1))
-                .notifyNetworkTestedWithExtras(eq(expectedResult), eq(null), anyLong(),
-                        bundleForNotifyNetworkTested(expectedResult));
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_VALID, PROBES_PRIVDNS_VALID);
         // NetworkMonitor will check if the probes has changed or not, if the probes has not
         // changed, the callback won't be fired.
         verify(mCallbacks, never()).notifyProbeStatusChanged(
-                eq(VALIDATION_RESULT_PRIVDNS_VALID), eq(VALIDATION_RESULT_PRIVDNS_VALID));
+                eq(PROBES_PRIVDNS_VALID), eq(PROBES_PRIVDNS_VALID));
 
         // Verify dns query get both v4 and v6 address.
         resetCallbacks();
         mFakeDns.setAnswer("dns.google", new String[]{"2001:db8::54"}, TYPE_AAAA);
         mFakeDns.setAnswer("dns.google", new String[]{"192.0.2.3"}, TYPE_A);
         wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns.google", new InetAddress[0]));
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1))
-                .notifyNetworkTestedWithExtras(eq(expectedResult), eq(null), anyLong(),
-                        bundleForNotifyNetworkTested(expectedResult));
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_VALID, PROBES_PRIVDNS_VALID);
         verify(mCallbacks, never()).notifyProbeStatusChanged(
-                eq(VALIDATION_RESULT_PRIVDNS_VALID), eq(VALIDATION_RESULT_PRIVDNS_VALID));
+                eq(PROBES_PRIVDNS_VALID), eq(PROBES_PRIVDNS_VALID));
     }
 
     @Test
@@ -1422,15 +1780,13 @@ public class NetworkMonitorTest {
         setStatus(mHttpsConnection, 204);
         setStatus(mHttpConnection, 204);
 
-        WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
         wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns.google", new InetAddress[0]));
-        wnm.notifyNetworkConnected(TEST_LINK_PROPERTIES, NOT_METERED_CAPABILITIES);
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyNetworkTestedWithExtras(
-                eq(NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS), eq(null),
-                anyLong(), bundleForNotifyNetworkTested(NETWORK_VALIDATION_PROBE_DNS
-                | NETWORK_VALIDATION_PROBE_HTTPS));
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyProbeStatusChanged(
-                eq(VALIDATION_RESULT_PRIVDNS_VALID), eq(NETWORK_VALIDATION_PROBE_DNS
+        wnm.notifyNetworkConnected(TEST_LINK_PROPERTIES, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTested(VALIDATION_RESULT_INVALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS)).notifyProbeStatusChanged(
+                eq(PROBES_PRIVDNS_VALID), eq(NETWORK_VALIDATION_PROBE_DNS
                 | NETWORK_VALIDATION_PROBE_HTTPS));
         // Fix DNS and retry, expect validation to succeed.
         resetCallbacks();
@@ -1440,13 +1796,9 @@ public class NetworkMonitorTest {
         // ProbeCompleted should be reset to 0
         HandlerUtilsKt.waitForIdle(wnm.getHandler(), HANDLER_TIMEOUT_MS);
         assertEquals(wnm.getEvaluationState().getProbeCompletedResult(), 0);
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1))
-                .notifyNetworkTestedWithExtras(eq(VALIDATION_RESULT_VALID
-                        | NETWORK_VALIDATION_PROBE_PRIVDNS), eq(null), anyLong(),
-                        bundleForNotifyNetworkTested(VALIDATION_RESULT_VALID
-                        | NETWORK_VALIDATION_PROBE_PRIVDNS));
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyProbeStatusChanged(
-                eq(VALIDATION_RESULT_PRIVDNS_VALID), eq(VALIDATION_RESULT_PRIVDNS_VALID));
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_VALID, PROBES_PRIVDNS_VALID);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS)).notifyProbeStatusChanged(
+                eq(PROBES_PRIVDNS_VALID), eq(PROBES_PRIVDNS_VALID));
     }
 
     @Test
@@ -1455,15 +1807,13 @@ public class NetworkMonitorTest {
         setStatus(mHttpsConnection, 204);
         setStatus(mHttpConnection, 204);
 
-        WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
         wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns.google", new InetAddress[0]));
-        wnm.notifyNetworkConnected(TEST_LINK_PROPERTIES, NOT_METERED_CAPABILITIES);
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS)).notifyNetworkTestedWithExtras(
-                eq(NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS), eq(null),
-                anyLong(), bundleForNotifyNetworkTested(NETWORK_VALIDATION_PROBE_DNS
-                | NETWORK_VALIDATION_PROBE_HTTPS));
+        wnm.notifyNetworkConnected(TEST_LINK_PROPERTIES, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTested(VALIDATION_RESULT_INVALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS);
         verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyProbeStatusChanged(
-                eq(VALIDATION_RESULT_PRIVDNS_VALID), eq(NETWORK_VALIDATION_PROBE_DNS
+                eq(PROBES_PRIVDNS_VALID), eq(NETWORK_VALIDATION_PROBE_DNS
                 | NETWORK_VALIDATION_PROBE_HTTPS));
 
         // Fix DNS and retry, expect validation to succeed.
@@ -1472,12 +1822,10 @@ public class NetworkMonitorTest {
 
         wnm.forceReevaluation(Process.myUid());
         verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).atLeastOnce())
-                .notifyNetworkTestedWithExtras(eq(VALIDATION_RESULT_VALID
-                        | NETWORK_VALIDATION_PROBE_PRIVDNS), eq(null), anyLong(),
-                        bundleForNotifyNetworkTested(VALIDATION_RESULT_VALID
-                        | NETWORK_VALIDATION_PROBE_PRIVDNS));
+                .notifyNetworkTestedWithExtras(matchNetworkTestResultParcelable(
+                        NETWORK_VALIDATION_RESULT_VALID, PROBES_PRIVDNS_VALID));
         verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyProbeStatusChanged(
-                eq(VALIDATION_RESULT_PRIVDNS_VALID), eq(VALIDATION_RESULT_PRIVDNS_VALID));
+                eq(PROBES_PRIVDNS_VALID), eq(PROBES_PRIVDNS_VALID));
 
         // Change configuration to an invalid DNS name, expect validation to fail.
         resetCallbacks();
@@ -1486,13 +1834,10 @@ public class NetworkMonitorTest {
         wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns.bad", new InetAddress[0]));
         // Strict mode hostname resolve fail. Expect only notification for evaluation fail. No probe
         // notification.
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS))
-                .notifyNetworkTestedWithExtras(eq(NETWORK_VALIDATION_PROBE_DNS
-                        | NETWORK_VALIDATION_PROBE_HTTPS), eq(null), anyLong(),
-                        bundleForNotifyNetworkTested(NETWORK_VALIDATION_PROBE_DNS
-                        | NETWORK_VALIDATION_PROBE_HTTPS));
+        verifyNetworkTested(VALIDATION_RESULT_INVALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS);
         verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyProbeStatusChanged(
-                eq(VALIDATION_RESULT_PRIVDNS_VALID), eq(NETWORK_VALIDATION_PROBE_DNS
+                eq(PROBES_PRIVDNS_VALID), eq(NETWORK_VALIDATION_PROBE_DNS
                 | NETWORK_VALIDATION_PROBE_HTTPS));
 
         // Change configuration back to working again, but make private DNS not work.
@@ -1501,107 +1846,299 @@ public class NetworkMonitorTest {
         mFakeDns.setNonBypassPrivateDnsWorking(false);
         wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns.google",
                 new InetAddress[0]));
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS)).notifyNetworkTestedWithExtras(
-                eq(NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS), eq(null),
-                anyLong(), bundleForNotifyNetworkTested(NETWORK_VALIDATION_PROBE_DNS
-                | NETWORK_VALIDATION_PROBE_HTTPS));
+        verifyNetworkTested(VALIDATION_RESULT_INVALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS);
         // NetworkMonitor will check if the probes has changed or not, if the probes has not
         // changed, the callback won't be fired.
         verify(mCallbacks, never()).notifyProbeStatusChanged(
-                eq(VALIDATION_RESULT_PRIVDNS_VALID), eq(NETWORK_VALIDATION_PROBE_DNS
+                eq(PROBES_PRIVDNS_VALID), eq(NETWORK_VALIDATION_PROBE_DNS
                 | NETWORK_VALIDATION_PROBE_HTTPS));
 
         // Make private DNS work again. Expect validation to succeed.
         resetCallbacks();
         mFakeDns.setNonBypassPrivateDnsWorking(true);
         wnm.forceReevaluation(Process.myUid());
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).atLeastOnce())
-                .notifyNetworkTestedWithExtras(
-                        eq(VALIDATION_RESULT_VALID | NETWORK_VALIDATION_PROBE_PRIVDNS), eq(null),
-                        anyLong(), bundleForNotifyNetworkTested(VALIDATION_RESULT_VALID
-                        | NETWORK_VALIDATION_PROBE_PRIVDNS));
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_VALID, PROBES_PRIVDNS_VALID);
         verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyProbeStatusChanged(
-                eq(VALIDATION_RESULT_PRIVDNS_VALID), eq(VALIDATION_RESULT_PRIVDNS_VALID));
+                eq(PROBES_PRIVDNS_VALID), eq(PROBES_PRIVDNS_VALID));
     }
 
     @Test
-    public void testDataStall_StallDnsSuspectedAndSendMetrics() throws IOException {
-        // Connect a VALID network to simulate the data stall detection because data stall
-        // evaluation will only start from validated state.
-        setStatus(mHttpsConnection, 204);
-        WrappedNetworkMonitor wrappedMonitor = makeNotMeteredNetworkMonitor();
-        wrappedMonitor.notifyNetworkConnected(TEST_LINK_PROPERTIES, METERED_CAPABILITIES);
-        verifyNetworkTested(VALIDATION_RESULT_VALID);
-        // Setup dns data stall signal.
-        wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
-        makeDnsTimeoutEvent(wrappedMonitor, 5);
-        assertTrue(wrappedMonitor.isDataStall());
+    public void testDataStall_StallDnsSuspectedAndSendMetricsOnCell() throws Exception {
+        testDataStall_StallDnsSuspectedAndSendMetrics(NetworkCapabilities.TRANSPORT_CELLULAR,
+                CELL_METERED_CAPABILITIES);
+    }
+
+    @Test
+    public void testDataStall_StallDnsSuspectedAndSendMetricsOnWifi() throws Exception {
+        testDataStall_StallDnsSuspectedAndSendMetrics(NetworkCapabilities.TRANSPORT_WIFI,
+                WIFI_NOT_METERED_CAPABILITIES);
+    }
+
+    private void testDataStall_StallDnsSuspectedAndSendMetrics(int transport,
+            NetworkCapabilities nc) throws Exception {
+        // NM suspects data stall from DNS signal and sends data stall metrics.
+        final WrappedNetworkMonitor nm = prepareNetworkMonitorForVerifyDataStall(nc);
+        makeDnsTimeoutEvent(nm, 5);
         // Trigger a dns signal to start evaluate data stall and upload metrics.
-        wrappedMonitor.notifyDnsResponse(RETURN_CODE_DNS_TIMEOUT);
-        // Setup information to prevent null data and cause NPE during testing.
-        when(mTelephony.getDataNetworkType()).thenReturn(TelephonyManager.NETWORK_TYPE_LTE);
-        when(mTelephony.getNetworkOperator()).thenReturn(TEST_MCCMNC);
-        when(mTelephony.getSimOperator()).thenReturn(TEST_MCCMNC);
-        // Verify data sent as expectation.
-        final DataStallDetectionStats stats = wrappedMonitor.buildDataStallDetectionStats(
-                NetworkCapabilities.TRANSPORT_CELLULAR);
-        final ArgumentCaptor<CaptivePortalProbeResult> probeResultCaptor =
-                ArgumentCaptor.forClass(CaptivePortalProbeResult.class);
-        verify(mDependencies, timeout(HANDLER_TIMEOUT_MS).times(1))
-                .writeDataStallDetectionStats(eq(stats), probeResultCaptor.capture());
-        assertTrue(probeResultCaptor.getValue().isSuccessful());
+        nm.notifyDnsResponse(RETURN_CODE_DNS_TIMEOUT);
+        // Verify data sent as expected.
+        verifySendDataStallDetectionStats(nm, DATA_STALL_EVALUATION_TYPE_DNS, transport);
     }
 
     @Test
-    public void testDataStall_NoStallSuspectedAndSendMetrics() throws IOException {
-        // Connect a VALID network to simulate the data stall detection because data stall
-        // evaluation will only start from validated state.
-        setStatus(mHttpsConnection, 204);
-        WrappedNetworkMonitor wrappedMonitor = makeNotMeteredNetworkMonitor();
-        wrappedMonitor.notifyNetworkConnected(TEST_LINK_PROPERTIES, METERED_CAPABILITIES);
-        verifyNetworkTested(VALIDATION_RESULT_VALID);
+    public void testDataStall_NoStallSuspectedAndSendMetrics() throws Exception {
+        final WrappedNetworkMonitor nm = prepareNetworkMonitorForVerifyDataStall(
+                CELL_METERED_CAPABILITIES);
         // Setup no data stall dns signal.
-        wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
-        makeDnsTimeoutEvent(wrappedMonitor, 3);
-        assertFalse(wrappedMonitor.isDataStall());
+        makeDnsTimeoutEvent(nm, 3);
+        assertFalse(nm.isDataStall());
         // Trigger a dns signal to start evaluate data stall.
-        wrappedMonitor.notifyDnsResponse(RETURN_CODE_DNS_SUCCESS);
+        nm.notifyDnsResponse(RETURN_CODE_DNS_SUCCESS);
         verify(mDependencies, never()).writeDataStallDetectionStats(any(), any());
     }
 
     @Test
-    public void testCollectDataStallMetrics() {
-        WrappedNetworkMonitor wrappedMonitor = makeNotMeteredNetworkMonitor();
+    public void testDataStall_StallTcpSuspectedAndSendMetricsOnCell() throws Exception {
+        testDataStall_StallTcpSuspectedAndSendMetrics(CELL_METERED_CAPABILITIES);
+    }
 
-        when(mTelephony.getDataNetworkType()).thenReturn(TelephonyManager.NETWORK_TYPE_LTE);
-        when(mTelephony.getNetworkOperator()).thenReturn(TEST_MCCMNC);
-        when(mTelephony.getSimOperator()).thenReturn(TEST_MCCMNC);
+    @Test
+    public void testDataStall_StallTcpSuspectedAndSendMetricsOnWifi() throws Exception {
+        testDataStall_StallTcpSuspectedAndSendMetrics(WIFI_NOT_METERED_CAPABILITIES);
+    }
 
-        DataStallDetectionStats.Builder stats =
-                new DataStallDetectionStats.Builder()
-                .setEvaluationType(DATA_STALL_EVALUATION_TYPE_DNS)
-                .setNetworkType(NetworkCapabilities.TRANSPORT_CELLULAR)
-                .setCellData(TelephonyManager.NETWORK_TYPE_LTE /* radioType */,
+    private void testDataStall_StallTcpSuspectedAndSendMetrics(NetworkCapabilities nc)
+            throws Exception {
+        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
+        setupTcpDataStall();
+        // NM suspects data stall from TCP signal and sends data stall metrics.
+        setDataStallEvaluationType(DATA_STALL_EVALUATION_TYPE_TCP);
+        final WrappedNetworkMonitor nm = prepareNetworkMonitorForVerifyDataStall(nc);
+
+        // Trigger a tcp event immediately.
+        setTcpPollingInterval(0);
+        nm.sendTcpPollingEvent();
+        // Allow only one transport type in the context of this test for simplification.
+        final int[] transports = nc.getTransportTypes();
+        assertEquals(1, transports.length);
+        verifySendDataStallDetectionStats(nm, DATA_STALL_EVALUATION_TYPE_TCP, transports[0]);
+    }
+
+    private WrappedNetworkMonitor prepareNetworkMonitorForVerifyDataStall(NetworkCapabilities nc)
+            throws Exception {
+        // Connect a VALID network to simulate the data stall detection because data stall
+        // evaluation will only start from validated state.
+        setStatus(mHttpsConnection, 204);
+        final WrappedNetworkMonitor nm;
+        // Allow only one transport type in the context of this test for simplification.
+        if (nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+            nm = makeCellMeteredNetworkMonitor();
+        } else if (nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            nm = makeWifiNotMeteredNetworkMonitor();
+            setupTestWifiInfo();
+        } else {
+            nm = null;
+            fail("Undefined transport type");
+        }
+        nm.notifyNetworkConnected(TEST_LINK_PROPERTIES, nc);
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_VALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS);
+        nm.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
+        return nm;
+    }
+
+    private void setupTcpDataStall() {
+        when(mTstDependencies.isTcpInfoParsingSupported()).thenReturn(true);
+        when(mTst.getLatestReceivedCount()).thenReturn(0);
+        when(mTst.getLatestPacketFailPercentage()).thenReturn(TEST_TCP_FAIL_RATE);
+        when(mTst.getSentSinceLastRecv()).thenReturn(TEST_TCP_PACKET_COUNT);
+        when(mTst.isDataStallSuspected()).thenReturn(true);
+        when(mTst.pollSocketsInfo()).thenReturn(true);
+    }
+
+    private void verifySendDataStallDetectionStats(WrappedNetworkMonitor nm, int evalType,
+            int transport) {
+        // Verify data sent as expectated.
+        final ArgumentCaptor<CaptivePortalProbeResult> probeResultCaptor =
+                ArgumentCaptor.forClass(CaptivePortalProbeResult.class);
+        final ArgumentCaptor<DataStallDetectionStats> statsCaptor =
+                ArgumentCaptor.forClass(DataStallDetectionStats.class);
+        verify(mDependencies, timeout(HANDLER_TIMEOUT_MS).times(1))
+                .writeDataStallDetectionStats(statsCaptor.capture(), probeResultCaptor.capture());
+        assertTrue(nm.isDataStall());
+        assertTrue(probeResultCaptor.getValue().isSuccessful());
+        verifyTestDataStallDetectionStats(evalType, transport, statsCaptor.getValue());
+    }
+
+    private void verifyTestDataStallDetectionStats(int evalType, int transport,
+            DataStallDetectionStats stats) {
+        assertEquals(transport, stats.mNetworkType);
+        switch (transport) {
+            case NetworkCapabilities.TRANSPORT_WIFI:
+                assertArrayEquals(makeTestWifiDataNano(), stats.mWifiInfo);
+                // Expedient way to check stats.mCellularInfo contains the neutral byte array that
+                // is sent to represent a lack of data, as stats.mCellularInfo is not supposed to
+                // contain null.
+                assertArrayEquals(DataStallDetectionStats.emptyCellDataIfNull(null),
+                        stats.mCellularInfo);
+                break;
+            case NetworkCapabilities.TRANSPORT_CELLULAR:
+                // Expedient way to check stats.mWifiInfo contains the neutral byte array that is
+                // sent to represent a lack of data, as stats.mWifiInfo is not supposed to contain
+                // null.
+                assertArrayEquals(DataStallDetectionStats.emptyWifiInfoIfNull(null),
+                        stats.mWifiInfo);
+                assertArrayEquals(makeTestCellDataNano(), stats.mCellularInfo);
+                break;
+            default:
+                // Add other cases.
+                fail("Unexpected transport type");
+        }
+
+        assertEquals(evalType, stats.mEvaluationType);
+        if ((evalType & DATA_STALL_EVALUATION_TYPE_TCP) != 0) {
+            assertEquals(TEST_TCP_FAIL_RATE, stats.mTcpFailRate);
+            assertEquals(TEST_TCP_PACKET_COUNT, stats.mTcpSentSinceLastRecv);
+        } else {
+            assertEquals(DataStallDetectionStats.UNSPECIFIED_TCP_FAIL_RATE, stats.mTcpFailRate);
+            assertEquals(DataStallDetectionStats.UNSPECIFIED_TCP_PACKETS_COUNT,
+                    stats.mTcpSentSinceLastRecv);
+        }
+
+        if ((evalType & DATA_STALL_EVALUATION_TYPE_DNS) != 0) {
+            assertArrayEquals(stats.mDns, makeTestDnsTimeoutNano(DEFAULT_DNS_TIMEOUT_THRESHOLD));
+        } else {
+            assertArrayEquals(stats.mDns, makeTestDnsTimeoutNano(0 /* times */));
+        }
+    }
+
+    private DataStallDetectionStats makeTestDataStallDetectionStats(int evaluationType,
+            int transportType) {
+        final DataStallDetectionStats.Builder stats = new DataStallDetectionStats.Builder()
+                .setEvaluationType(evaluationType)
+                .setNetworkType(transportType);
+        switch (transportType) {
+            case NetworkCapabilities.TRANSPORT_CELLULAR:
+                stats.setCellData(TelephonyManager.NETWORK_TYPE_LTE /* radioType */,
                         true /* roaming */,
                         TEST_MCCMNC /* networkMccmnc */,
                         TEST_MCCMNC /* simMccmnc */,
                         CellSignalStrength.SIGNAL_STRENGTH_NONE_OR_UNKNOWN /* signalStrength */);
-        generateTimeoutDnsEvent(stats, DEFAULT_DNS_TIMEOUT_THRESHOLD);
+                break;
+            case NetworkCapabilities.TRANSPORT_WIFI:
+                setupTestWifiInfo();
+                stats.setWiFiData(mWifiInfo);
+                break;
+            default:
+                break;
+        }
 
-        assertEquals(wrappedMonitor.buildDataStallDetectionStats(
-                 NetworkCapabilities.TRANSPORT_CELLULAR), stats.build());
+        if ((evaluationType & DATA_STALL_EVALUATION_TYPE_TCP) != 0) {
+            generateTestTcpStats(stats);
+        }
 
+        if ((evaluationType & DATA_STALL_EVALUATION_TYPE_DNS) != 0) {
+            generateTimeoutDnsEvent(stats, DEFAULT_DNS_TIMEOUT_THRESHOLD);
+        }
+
+        return stats.build();
+    }
+
+    private byte[] makeTestDnsTimeoutNano(int timeoutCount) {
+        // Make a expected nano dns message.
+        final DnsEvent event = new DnsEvent();
+        event.dnsReturnCode = new int[timeoutCount];
+        event.dnsTime = new long[timeoutCount];
+        Arrays.fill(event.dnsReturnCode, RETURN_CODE_DNS_TIMEOUT);
+        Arrays.fill(event.dnsTime, TEST_ELAPSED_TIME_MS);
+        return MessageNano.toByteArray(event);
+    }
+
+    private byte[] makeTestCellDataNano() {
+        final CellularData data = new CellularData();
+        data.ratType = DataStallEventProto.RADIO_TECHNOLOGY_LTE;
+        data.networkMccmnc = TEST_MCCMNC;
+        data.simMccmnc = TEST_MCCMNC;
+        data.isRoaming = true;
+        data.signalStrength = 0;
+        return MessageNano.toByteArray(data);
+    }
+
+    private byte[] makeTestWifiDataNano() {
+        final WifiData data = new WifiData();
+        data.wifiBand = DataStallEventProto.AP_BAND_2GHZ;
+        data.signalStrength = TEST_SIGNAL_STRENGTH;
+        return MessageNano.toByteArray(data);
+    }
+
+    private void setupTestWifiInfo() {
         when(mWifi.getConnectionInfo()).thenReturn(mWifiInfo);
+        when(mWifiInfo.getRssi()).thenReturn(TEST_SIGNAL_STRENGTH);
+        // Set to 2.4G band. Map to DataStallEventProto.AP_BAND_2GHZ proto definition.
+        when(mWifiInfo.getFrequency()).thenReturn(2450);
+    }
 
-        stats = new DataStallDetectionStats.Builder()
-                .setEvaluationType(DATA_STALL_EVALUATION_TYPE_DNS)
-                .setNetworkType(NetworkCapabilities.TRANSPORT_WIFI)
-                .setWiFiData(mWifiInfo);
-        generateTimeoutDnsEvent(stats, DEFAULT_DNS_TIMEOUT_THRESHOLD);
+    private void testDataStallMetricsWithCellular(int evalType) {
+        testDataStallMetrics(evalType, NetworkCapabilities.TRANSPORT_CELLULAR);
+    }
 
-        assertEquals(
-                wrappedMonitor.buildDataStallDetectionStats(NetworkCapabilities.TRANSPORT_WIFI),
-                stats.build());
+    private void testDataStallMetricsWithWiFi(int evalType) {
+        testDataStallMetrics(evalType, NetworkCapabilities.TRANSPORT_WIFI);
+    }
+
+    private void testDataStallMetrics(int evalType, int transportType) {
+        setDataStallEvaluationType(evalType);
+        final NetworkCapabilities nc = new NetworkCapabilities()
+                .addTransportType(transportType)
+                .addCapability(NET_CAPABILITY_INTERNET);
+        final WrappedNetworkMonitor wrappedMonitor = makeMonitor(nc);
+        setupTestWifiInfo();
+        final DataStallDetectionStats stats =
+                makeTestDataStallDetectionStats(evalType, transportType);
+        assertEquals(wrappedMonitor.buildDataStallDetectionStats(transportType, evalType), stats);
+
+        if ((evalType & DATA_STALL_EVALUATION_TYPE_TCP) != 0) {
+            verify(mTst, timeout(HANDLER_TIMEOUT_MS).atLeastOnce()).getLatestPacketFailPercentage();
+        } else {
+            verify(mTst, never()).getLatestPacketFailPercentage();
+        }
+    }
+
+    @Test
+    public void testCollectDataStallMetrics_DnsWithCellular() {
+        testDataStallMetricsWithCellular(DATA_STALL_EVALUATION_TYPE_DNS);
+    }
+
+    @Test
+    public void testCollectDataStallMetrics_DnsWithWiFi() {
+        testDataStallMetricsWithWiFi(DATA_STALL_EVALUATION_TYPE_DNS);
+    }
+
+    @Test
+    public void testCollectDataStallMetrics_TcpWithCellular() {
+        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
+        testDataStallMetricsWithCellular(DATA_STALL_EVALUATION_TYPE_TCP);
+    }
+
+    @Test
+    public void testCollectDataStallMetrics_TcpWithWiFi() {
+        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
+        testDataStallMetricsWithWiFi(DATA_STALL_EVALUATION_TYPE_TCP);
+    }
+
+    @Test
+    public void testCollectDataStallMetrics_TcpAndDnsWithWifi() {
+        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
+        testDataStallMetricsWithWiFi(
+                DATA_STALL_EVALUATION_TYPE_TCP | DATA_STALL_EVALUATION_TYPE_DNS);
+    }
+
+    @Test
+    public void testCollectDataStallMetrics_TcpAndDnsWithCellular() {
+        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
+        testDataStallMetricsWithCellular(
+                DATA_STALL_EVALUATION_TYPE_TCP | DATA_STALL_EVALUATION_TYPE_DNS);
     }
 
     @Test
@@ -1609,29 +2146,31 @@ public class NetworkMonitorTest {
         setSslException(mHttpsConnection);
         setStatus(mHttpConnection, 204);
         // Expect to send HTTP, HTTPS, FALLBACK probe and evaluation result notifications to CS.
-        final NetworkMonitor nm = runNetworkTest(VALIDATION_RESULT_PARTIAL);
+        final NetworkMonitor nm = runNetworkTest(NETWORK_VALIDATION_RESULT_PARTIAL,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP,
+                null /* redirectUrl */);
 
-        final int expectedResult = VALIDATION_RESULT_PARTIAL | NETWORK_VALIDATION_RESULT_VALID;
         resetCallbacks();
         nm.setAcceptPartialConnectivity();
         // Expect to update evaluation result notifications to CS.
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyNetworkTestedWithExtras(
-                eq(expectedResult), eq(null), anyLong(), bundleForNotifyNetworkTested(
-                expectedResult));
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_PARTIAL | NETWORK_VALIDATION_RESULT_VALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP);
     }
 
     @Test
-    public void testIsPartialConnectivity() throws IOException {
+    public void testIsPartialConnectivity() throws Exception {
         setStatus(mHttpsConnection, 500);
         setStatus(mHttpConnection, 204);
         setStatus(mFallbackConnection, 500);
-        runPartialConnectivityNetworkTest(VALIDATION_RESULT_PARTIAL);
+        runPartialConnectivityNetworkTest(
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP);
 
         resetCallbacks();
         setStatus(mHttpsConnection, 500);
         setStatus(mHttpConnection, 500);
         setStatus(mFallbackConnection, 204);
-        runPartialConnectivityNetworkTest(VALIDATION_RESULT_FALLBACK_PARTIAL);
+        runPartialConnectivityNetworkTest(
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_FALLBACK);
     }
 
     private void assertIpAddressArrayEquals(String[] expected, InetAddress[] actual) {
@@ -1644,7 +2183,7 @@ public class NetworkMonitorTest {
 
     @Test
     public void testSendDnsProbeWithTimeout() throws Exception {
-        WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
         final int shortTimeoutMs = 200;
         // v6 only.
         String[] expected = new String[]{"2001:db8::"};
@@ -1681,22 +2220,18 @@ public class NetworkMonitorTest {
 
     @Test
     public void testNotifyNetwork_WithforceReevaluation() throws Exception {
-        final int expectedResult = NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_FALLBACK
-                | NETWORK_VALIDATION_RESULT_PARTIAL;
-
+        setValidProbes();
         final NetworkMonitor nm = runValidatedNetworkTest();
-        // Verify forceReevalution will not reset the validation result but only probe result until
+        // Verify forceReevaluation will not reset the validation result but only probe result until
         // getting the validation result.
         resetCallbacks();
         setSslException(mHttpsConnection);
         setStatus(mHttpConnection, 500);
         setStatus(mFallbackConnection, 204);
         nm.forceReevaluation(Process.myUid());
-        final ArgumentCaptor<Integer> intCaptor = ArgumentCaptor.forClass(Integer.class);
         // Expect to send HTTP, HTTPs, FALLBACK and evaluation results.
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS))
-                .notifyNetworkTestedWithExtras(eq(expectedResult), any(), anyLong(),
-                        bundleForNotifyNetworkTested(expectedResult));
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_PARTIAL,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_FALLBACK);
     }
 
     @Test
@@ -1708,32 +2243,49 @@ public class NetworkMonitorTest {
         // Trigger Network validation
         setStatus(mHttpsConnection, 204);
         setStatus(mHttpConnection, 204);
-        final NetworkMonitor nm = makeMonitor(METERED_CAPABILITIES);
-        nm.notifyNetworkConnected(TEST_LINK_PROPERTIES, METERED_CAPABILITIES);
+        final NetworkMonitor nm = makeMonitor(CELL_METERED_CAPABILITIES);
+        nm.notifyNetworkConnected(TEST_LINK_PROPERTIES, CELL_METERED_CAPABILITIES);
 
         verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS))
-                .notifyNetworkTested(eq(VALIDATION_RESULT_VALID), any());
+                .notifyNetworkTested(eq(NETWORK_VALIDATION_RESULT_VALID
+                        | NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS),
+                        eq(null) /* redirectUrl */);
     }
 
     @Test
     public void testDismissPortalInValidatedNetworkEnabledOsSupported() throws Exception {
-        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
-        testDismissPortalInValidatedNetworkEnabled(TEST_LOGIN_URL);
+        assumeTrue(ShimUtils.isAtLeastR());
+        testDismissPortalInValidatedNetworkEnabled(TEST_LOGIN_URL, TEST_LOGIN_URL);
+    }
+
+    @Test
+    public void testDismissPortalInValidatedNetworkEnabledOsSupported_NullLocationUrl()
+            throws Exception {
+        assumeTrue(ShimUtils.isAtLeastR());
+        testDismissPortalInValidatedNetworkEnabled(TEST_HTTP_URL, null /* locationUrl */);
+    }
+
+    @Test
+    public void testDismissPortalInValidatedNetworkEnabledOsSupported_InvalidLocationUrl()
+            throws Exception {
+        assumeTrue(ShimUtils.isAtLeastR());
+        testDismissPortalInValidatedNetworkEnabled(TEST_HTTP_URL, TEST_RELATIVE_URL);
     }
 
     @Test
     public void testDismissPortalInValidatedNetworkEnabledOsNotSupported() throws Exception {
-        assumeFalse(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
-        testDismissPortalInValidatedNetworkEnabled(TEST_HTTP_URL);
+        assumeFalse(ShimUtils.isAtLeastR());
+        testDismissPortalInValidatedNetworkEnabled(TEST_HTTP_URL, TEST_LOGIN_URL);
     }
 
-    private void testDismissPortalInValidatedNetworkEnabled(String portalUrl) throws Exception {
+    private void testDismissPortalInValidatedNetworkEnabled(String expectedUrl, String locationUrl)
+            throws Exception {
         setDismissPortalInValidatedNetwork(true);
         setSslException(mHttpsConnection);
         setPortal302(mHttpConnection);
-        when(mHttpConnection.getHeaderField(eq("location"))).thenReturn(TEST_LOGIN_URL);
-        final NetworkMonitor nm = makeMonitor(METERED_CAPABILITIES);
-        notifyNetworkConnected(nm, METERED_CAPABILITIES);
+        when(mHttpConnection.getHeaderField(eq("location"))).thenReturn(locationUrl);
+        final NetworkMonitor nm = makeMonitor(CELL_METERED_CAPABILITIES);
+        notifyNetworkConnected(nm, CELL_METERED_CAPABILITIES);
 
         verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1))
             .showProvisioningNotification(any(), any());
@@ -1756,20 +2308,23 @@ public class NetworkMonitorTest {
         assertEquals(TEST_NETID, networkCaptor.getValue().netId);
         // Portal URL should be redirect URL.
         final String redirectUrl = bundle.getString(ConnectivityManager.EXTRA_CAPTIVE_PORTAL_URL);
-        assertEquals(portalUrl, redirectUrl);
+        assertEquals(expectedUrl, redirectUrl);
     }
 
     @Test
     public void testEvaluationState_clearProbeResults() throws Exception {
+        setValidProbes();
         final NetworkMonitor nm = runValidatedNetworkTest();
         nm.getEvaluationState().clearProbeResults();
         // Verify probe results are all reset and only evaluation result left.
         assertEquals(NETWORK_VALIDATION_RESULT_VALID,
-                nm.getEvaluationState().getNetworkTestResult());
+                nm.getEvaluationState().getEvaluationResult());
+        assertEquals(0, nm.getEvaluationState().getProbeResults());
     }
 
     @Test
     public void testEvaluationState_reportProbeResult() throws Exception {
+        setValidProbes();
         final NetworkMonitor nm = runValidatedNetworkTest();
 
         resetCallbacks();
@@ -1778,42 +2333,43 @@ public class NetworkMonitorTest {
                 CaptivePortalProbeResult.success(1 << PROBE_HTTP));
         // Verify result should be appended and notifyNetworkTestedWithExtras callback is triggered
         // once.
-        assertEquals(nm.getEvaluationState().getNetworkTestResult(),
-                VALIDATION_RESULT_VALID | NETWORK_VALIDATION_PROBE_HTTP);
+        assertEquals(NETWORK_VALIDATION_RESULT_VALID,
+                nm.getEvaluationState().getEvaluationResult());
+        assertEquals(NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS
+                | NETWORK_VALIDATION_PROBE_HTTP, nm.getEvaluationState().getProbeResults());
 
         nm.reportHttpProbeResult(NETWORK_VALIDATION_PROBE_HTTP,
                 CaptivePortalProbeResult.failed(1 << PROBE_HTTP));
         // Verify DNS probe result should not be cleared.
-        assertTrue((nm.getEvaluationState().getNetworkTestResult() & NETWORK_VALIDATION_PROBE_DNS)
-                == NETWORK_VALIDATION_PROBE_DNS);
+        assertEquals(NETWORK_VALIDATION_PROBE_DNS,
+                nm.getEvaluationState().getProbeResults() & NETWORK_VALIDATION_PROBE_DNS);
     }
 
     @Test
     public void testEvaluationState_reportEvaluationResult() throws Exception {
-        final NetworkMonitor nm = runValidatedNetworkTest();
-
-        nm.getEvaluationState().reportEvaluationResult(NETWORK_VALIDATION_RESULT_PARTIAL,
+        setStatus(mHttpsConnection, 500);
+        setStatus(mHttpConnection, 204);
+        final NetworkMonitor nm = runNetworkTest(NETWORK_VALIDATION_RESULT_PARTIAL,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP,
                 null /* redirectUrl */);
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyNetworkTestedWithExtras(
-                eq(NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS
-                | NETWORK_VALIDATION_RESULT_PARTIAL), eq(null), anyLong(),
-                bundleForNotifyNetworkTested(NETWORK_VALIDATION_PROBE_DNS
-                | NETWORK_VALIDATION_PROBE_HTTPS | NETWORK_VALIDATION_RESULT_PARTIAL));
+
+        nm.getEvaluationState().reportEvaluationResult(NETWORK_VALIDATION_RESULT_VALID,
+                null /* redirectUrl */);
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_VALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP);
 
         nm.getEvaluationState().reportEvaluationResult(
                 NETWORK_VALIDATION_RESULT_VALID | NETWORK_VALIDATION_RESULT_PARTIAL,
                 null /* redirectUrl */);
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyNetworkTestedWithExtras(
-                eq(VALIDATION_RESULT_VALID | NETWORK_VALIDATION_RESULT_PARTIAL), eq(null),
-                anyLong(), bundleForNotifyNetworkTested(VALIDATION_RESULT_VALID
-                | NETWORK_VALIDATION_RESULT_PARTIAL));
+        verifyNetworkTested(
+                NETWORK_VALIDATION_RESULT_VALID | NETWORK_VALIDATION_RESULT_PARTIAL,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP);
 
         nm.getEvaluationState().reportEvaluationResult(VALIDATION_RESULT_INVALID,
                 TEST_REDIRECT_URL);
-        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyNetworkTestedWithExtras(
-                eq(NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS),
-                eq(TEST_REDIRECT_URL), anyLong(), bundleForNotifyNetworkTested(
-                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS));
+        verifyNetworkTested(VALIDATION_RESULT_INVALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP,
+                TEST_REDIRECT_URL);
     }
 
     @Test
@@ -1860,16 +2416,14 @@ public class NetworkMonitorTest {
 
     @Test
     public void testReadAsString_StreamShorterThanLimit() throws Exception {
-        final WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
-        final String content = "The HTTP response code is 200 but it is not a captive portal.";
-        ByteArrayInputStream inputStream = new ByteArrayInputStream(
-                content.getBytes(StandardCharsets.UTF_8));
-        assertEquals(content, wnm.readAsString(inputStream, content.length(),
-                StandardCharsets.UTF_8));
-        // Reset the inputStream and test the case that the stream ends earlier than the limit.
-        inputStream = new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8));
-        assertEquals(content, wnm.readAsString(inputStream, content.length() + 10,
-                StandardCharsets.UTF_8));
+        final WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        final byte[] content = "The HTTP response code is 200 but it is not a captive portal."
+                .getBytes(StandardCharsets.UTF_8);
+        assertEquals(new String(content), wnm.readAsString(new ByteArrayInputStream(content),
+                content.length, StandardCharsets.UTF_8));
+        // Test the case that the stream ends earlier than the limit.
+        assertEquals(new String(content), wnm.readAsString(new ByteArrayInputStream(content),
+                content.length + 10, StandardCharsets.UTF_8));
     }
 
     @Test
@@ -1877,10 +2431,13 @@ public class NetworkMonitorTest {
         setupResourceForMultipleProbes();
         // One of the http probes is portal, then result is portal.
         setPortal302(mOtherHttpConnection1);
-        runPortalNetworkTest(VALIDATION_RESULT_INVALID);
+        runPortalNetworkTest();
         // Get conclusive result from one of the HTTP probe. Expect to create 2 HTTP and 2 HTTPS
-        // probes as resource configuration.
-        verify(mCleartextDnsNetwork, times(4)).openConnection(any());
+        // probes as resource configuration, but the portal can be detected before other probes
+        // start.
+        verify(mCleartextDnsNetwork, atMost(4)).openConnection(any());
+        verify(mCleartextDnsNetwork, atLeastOnce()).openConnection(any());
+        verify(mOtherHttpConnection1).getResponseCode();
     }
 
     @Test
@@ -1888,30 +2445,36 @@ public class NetworkMonitorTest {
         setupResourceForMultipleProbes();
         // One of the https probes succeeds, then it's validated.
         setStatus(mOtherHttpsConnection2, 204);
-        runNetworkTest(VALIDATION_RESULT_VALID);
+        runValidatedNetworkTest();
         // Get conclusive result from one of the HTTPS probe. Expect to create 2 HTTP and 2 HTTPS
-        // probes as resource configuration.
-        verify(mCleartextDnsNetwork, times(4)).openConnection(any());
+        // probes as resource configuration, but the network may validate from the HTTPS probe
+        // before other probes start.
+        verify(mCleartextDnsNetwork, atMost(4)).openConnection(any());
+        verify(mCleartextDnsNetwork, atLeastOnce()).openConnection(any());
+        verify(mOtherHttpsConnection2).getResponseCode();
     }
 
     @Test
-    public void testMultipleProbesOnInValiadNetworkForPrioritizedResource() throws Exception {
+    public void testMultipleProbesOnInValidNetworkForPrioritizedResource() throws Exception {
         setupResourceForMultipleProbes();
         // The configuration resource is prioritized. Only use configurations from resource.(i.e
         // Only configuration for mOtherHttpsConnection2, mOtherHttpsConnection2,
         // mOtherHttpConnection2, mOtherHttpConnection2 will affect the result.)
         // Configure mHttpsConnection is no-op.
         setStatus(mHttpsConnection, 204);
-        runNetworkTest(VALIDATION_RESULT_INVALID);
+        runFailedNetworkTest();
         // No conclusive result from both HTTP and HTTPS probes. Expect to create 2 HTTP and 2 HTTPS
-        // probes as resource configuration.
+        // probes as resource configuration. All probes are expected to have been run because this
+        // network is set to never validate (no probe has a success or portal result), so NM tests
+        // all probes to completion.
         verify(mCleartextDnsNetwork, times(4)).openConnection(any());
+        verify(mHttpsConnection, never()).getResponseCode();
     }
 
     @Test
-    public void testMultipleProbesOnInValiadNetwork() throws Exception {
+    public void testMultipleProbesOnInValidNetwork() throws Exception {
         setupResourceForMultipleProbes();
-        runNetworkTest(VALIDATION_RESULT_INVALID);
+        runFailedNetworkTest();
         // No conclusive result from both HTTP and HTTPS probes. Expect to create 2 HTTP and 2 HTTPS
         // probes as resource configuration.
         verify(mCleartextDnsNetwork, times(4)).openConnection(any());
@@ -1993,65 +2556,90 @@ public class NetworkMonitorTest {
                 eq(DISMISS_PORTAL_IN_VALIDATED_NETWORK), anyBoolean())).thenReturn(enabled);
     }
 
-    private void runPortalNetworkTest(int result) {
-        runNetworkTest(result);
+    private void setDeviceConfig(String key, String value) {
+        doReturn(value).when(mDependencies).getDeviceConfigProperty(eq(NAMESPACE_CONNECTIVITY),
+                eq(key), any() /* defaultValue */);
+    }
+
+    private NetworkMonitor runPortalNetworkTest() throws RemoteException {
+        final NetworkMonitor nm = runNetworkTest(VALIDATION_RESULT_PORTAL,
+                0 /* probesSucceeded */, TEST_LOGIN_URL);
         assertEquals(1, mRegisteredReceivers.size());
-        assertNotNull(mNetworkTestedRedirectUrlCaptor.getValue());
+        return nm;
     }
 
-    private void runNotPortalNetworkTest() {
-        runNetworkTest(VALIDATION_RESULT_VALID);
+    private NetworkMonitor runNoValidationNetworkTest() throws RemoteException {
+        final NetworkMonitor nm = runNetworkTest(NETWORK_VALIDATION_RESULT_VALID,
+                0 /* probesSucceeded */, null /* redirectUrl */);
         assertEquals(0, mRegisteredReceivers.size());
-        assertNull(mNetworkTestedRedirectUrlCaptor.getValue());
+        return nm;
     }
 
-    private void runNoValidationNetworkTest() {
-        runNetworkTest(NETWORK_VALIDATION_RESULT_VALID);
+    private NetworkMonitor runFailedNetworkTest() throws RemoteException {
+        final NetworkMonitor nm = runNetworkTest(
+                VALIDATION_RESULT_INVALID, 0 /* probesSucceeded */, null /* redirectUrl */);
         assertEquals(0, mRegisteredReceivers.size());
-        assertNull(mNetworkTestedRedirectUrlCaptor.getValue());
+        return nm;
     }
 
-    private void runFailedNetworkTest() {
-        runNetworkTest(VALIDATION_RESULT_INVALID);
+    private NetworkMonitor runPartialConnectivityNetworkTest(int probesSucceeded)
+            throws RemoteException {
+        final NetworkMonitor nm = runNetworkTest(NETWORK_VALIDATION_RESULT_PARTIAL,
+                probesSucceeded, null /* redirectUrl */);
         assertEquals(0, mRegisteredReceivers.size());
-        assertNull(mNetworkTestedRedirectUrlCaptor.getValue());
+        return nm;
     }
 
-    private void runPartialConnectivityNetworkTest(int result) {
-        runNetworkTest(result);
-        assertEquals(0, mRegisteredReceivers.size());
-        assertNull(mNetworkTestedRedirectUrlCaptor.getValue());
+    private NetworkMonitor runValidatedNetworkTest() throws RemoteException {
+        // Expect to send HTTPS and evaluation results.
+        return runNetworkTest(NETWORK_VALIDATION_RESULT_VALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS,
+                null /* redirectUrl */);
     }
 
-    private NetworkMonitor runValidatedNetworkTest() throws IOException {
-        setStatus(mHttpsConnection, 204);
-        setStatus(mHttpConnection, 204);
-        // Expect to send HTTPs and evaluation results.
-        return runNetworkTest(VALIDATION_RESULT_VALID);
-    }
-
-    private NetworkMonitor runNetworkTest(int testResult) {
-        return runNetworkTest(TEST_LINK_PROPERTIES, METERED_CAPABILITIES, testResult);
+    private NetworkMonitor runNetworkTest(int testResult, int probesSucceeded, String redirectUrl)
+            throws RemoteException {
+        return runNetworkTest(TEST_LINK_PROPERTIES, CELL_METERED_CAPABILITIES, testResult,
+                probesSucceeded, redirectUrl);
     }
 
     private NetworkMonitor runNetworkTest(LinkProperties lp, NetworkCapabilities nc,
-            int testResult) {
+            int testResult, int probesSucceeded, String redirectUrl) throws RemoteException {
         final NetworkMonitor monitor = makeMonitor(nc);
         monitor.notifyNetworkConnected(lp, nc);
-        verifyNetworkTested(testResult);
+        verifyNetworkTested(testResult, probesSucceeded, redirectUrl);
         HandlerUtilsKt.waitForIdle(monitor.getHandler(), HANDLER_TIMEOUT_MS);
 
         return monitor;
     }
 
-    private void verifyNetworkTested(int testResult) {
+    private void verifyNetworkTested(int testResult, int probesSucceeded) throws RemoteException {
+        verifyNetworkTested(testResult, probesSucceeded, null /* redirectUrl */);
+    }
+
+    private void verifyNetworkTested(int testResult, int probesSucceeded, String redirectUrl)
+            throws RemoteException {
         try {
-            verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS))
-                    .notifyNetworkTestedWithExtras(eq(testResult),
-                            mNetworkTestedRedirectUrlCaptor.capture(), anyLong(),
-                            bundleForNotifyNetworkTested(testResult));
-        } catch (RemoteException e) {
-            fail("Unexpected exception: " + e);
+            verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS)).notifyNetworkTestedWithExtras(
+                    matchNetworkTestResultParcelable(testResult, probesSucceeded, redirectUrl));
+        } catch (AssertionFailedError e) {
+            // Capture the callbacks up to now to give a better error message
+            final ArgumentCaptor<NetworkTestResultParcelable> captor =
+                    ArgumentCaptor.forClass(NetworkTestResultParcelable.class);
+
+            // Call verify() again to verify the same method call verified by the previous verify
+            // call which failed, but this time use a captor to log the exact parcel sent by
+            // NetworkMonitor.
+            // This assertion will fail if notifyNetworkTested was not called at all.
+            verify(mCallbacks).notifyNetworkTestedWithExtras(captor.capture());
+
+            final NetworkTestResultParcelable lastResult = captor.getValue();
+            fail(String.format("notifyNetworkTestedWithExtras was not called with the "
+                    + "expected result within timeout. "
+                    + "Expected result %d, probes succeeded %d, redirect URL %s, "
+                    + "last result was (%d, %d, %s).",
+                    testResult, probesSucceeded, redirectUrl,
+                    lastResult.result, lastResult.probesSucceeded, lastResult.redirectUrl));
         }
     }
 
@@ -2063,13 +2651,18 @@ public class NetworkMonitorTest {
         doThrow(new SSLHandshakeException("Invalid cert")).when(connection).getResponseCode();
     }
 
+    private void setValidProbes() throws IOException {
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+    }
+
     private void set302(HttpURLConnection connection, String location) throws IOException {
         setStatus(connection, 302);
         doReturn(location).when(connection).getHeaderField(LOCATION_HEADER);
     }
 
     private void setPortal302(HttpURLConnection connection) throws IOException {
-        set302(connection, "http://login.example.com");
+        set302(connection, TEST_LOGIN_URL);
     }
 
     private void setApiContent(HttpURLConnection connection, String content) throws IOException {
@@ -2088,36 +2681,42 @@ public class NetworkMonitorTest {
 
     private void generateTimeoutDnsEvent(DataStallDetectionStats.Builder stats, int num) {
         for (int i = 0; i < num; i++) {
-            stats.addDnsEvent(RETURN_CODE_DNS_TIMEOUT, 123456789 /* timeMs */);
+            stats.addDnsEvent(RETURN_CODE_DNS_TIMEOUT, TEST_ELAPSED_TIME_MS /* timeMs */);
         }
     }
 
-    private PersistableBundle bundleForNotifyNetworkTested(final int result) {
-        // result = KEY_NETWORK_PROBES_SUCCEEDED_BITMASK | KEY_NETWORK_VALIDATION_RESULT
-        // See NetworkMonitor.EvaluationState#getNetworkTestResult
-        final int validationResult = result & NOTIFY_NETWORK_TESTED_VALIDATION_RESULT_MASK;
-        final int probesSucceeded = result & NOTIFY_NETWORK_TESTED_SUCCESSFUL_PROBES_MASK;
-
-        return argThat(bundle ->
-                bundle.containsKey(KEY_NETWORK_PROBES_ATTEMPTED_BITMASK)
-                && bundle.containsKey(KEY_NETWORK_PROBES_SUCCEEDED_BITMASK)
-                && (bundle.getInt(KEY_NETWORK_PROBES_SUCCEEDED_BITMASK) & probesSucceeded)
-                        == probesSucceeded
-                && bundle.containsKey(KEY_NETWORK_VALIDATION_RESULT)
-                && (bundle.getInt(KEY_NETWORK_VALIDATION_RESULT) & validationResult)
-                        == validationResult);
+    private void generateTestTcpStats(DataStallDetectionStats.Builder stats) {
+        when(mTst.getLatestPacketFailPercentage()).thenReturn(TEST_TCP_FAIL_RATE);
+        when(mTst.getSentSinceLastRecv()).thenReturn(TEST_TCP_PACKET_COUNT);
+        stats.setTcpFailRate(TEST_TCP_FAIL_RATE).setTcpSentSinceLastRecv(TEST_TCP_PACKET_COUNT);
     }
 
-    private PersistableBundle bundleForDnsDataStall(final int timeoutCount) {
-        return argThat(bundle ->
-                bundle.containsKey(KEY_DNS_CONSECUTIVE_TIMEOUTS)
-                && bundle.getInt(KEY_DNS_CONSECUTIVE_TIMEOUTS) == timeoutCount);
+    private NetworkTestResultParcelable matchNetworkTestResultParcelable(final int result,
+            final int probesSucceeded) {
+        return matchNetworkTestResultParcelable(result, probesSucceeded, null /* redirectUrl */);
     }
 
-    private PersistableBundle bundleForTcpDataStall() {
-        return argThat(bundle ->
-                bundle.containsKey(KEY_TCP_METRICS_COLLECTION_PERIOD_MILLIS)
-                && bundle.containsKey(KEY_TCP_PACKET_FAIL_RATE));
+    private NetworkTestResultParcelable matchNetworkTestResultParcelable(final int result,
+            final int probesSucceeded, String redirectUrl) {
+        // TODO: also verify probesAttempted
+        return argThat(p -> p.result == result && p.probesSucceeded == probesSucceeded
+                && Objects.equals(p.redirectUrl, redirectUrl));
+    }
+
+    private DataStallReportParcelable matchDnsAndTcpDataStallParcelable(final int timeoutCount) {
+        return argThat(p ->
+                (p.detectionMethod & ConstantsShim.DETECTION_METHOD_DNS_EVENTS) != 0
+                && (p.detectionMethod & ConstantsShim.DETECTION_METHOD_TCP_METRICS) != 0
+                && p.dnsConsecutiveTimeouts == timeoutCount);
+    }
+
+    private DataStallReportParcelable matchDnsDataStallParcelable(final int timeoutCount) {
+        return argThat(p -> (p.detectionMethod & ConstantsShim.DETECTION_METHOD_DNS_EVENTS) != 0
+                && p.dnsConsecutiveTimeouts == timeoutCount);
+    }
+
+    private DataStallReportParcelable matchTcpDataStallParcelable() {
+        return argThat(p -> (p.detectionMethod & ConstantsShim.DETECTION_METHOD_TCP_METRICS) != 0);
     }
 }
 

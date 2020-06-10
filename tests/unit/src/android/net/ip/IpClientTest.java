@@ -49,6 +49,7 @@ import android.net.MacAddress;
 import android.net.NetworkStackIpMemoryStore;
 import android.net.RouteInfo;
 import android.net.ipmemorystore.NetworkAttributes;
+import android.net.metrics.IpConnectivityLog;
 import android.net.shared.InitialConfiguration;
 import android.net.shared.ProvisioningConfiguration;
 import android.net.util.InterfaceParams;
@@ -92,7 +93,7 @@ public class IpClientTest {
     private static final MacAddress TEST_MAC = MacAddress.fromString("00:00:5E:00:53:01");
     private static final int TEST_TIMEOUT_MS = 400;
     private static final String TEST_L2KEY = "some l2key";
-    private static final String TEST_GROUPHINT = "some grouphint";
+    private static final String TEST_CLUSTER = "some cluster";
 
     private static final String TEST_GLOBAL_ADDRESS = "1234:4321::548d:2db2:4fcf:ef75/64";
     private static final String[] TEST_LOCAL_ADDRESSES = {
@@ -120,6 +121,7 @@ public class IpClientTest {
     @Mock private NetworkStackIpMemoryStore mIpMemoryStore;
     @Mock private IpMemoryStoreService mIpMemoryStoreService;
     @Mock private InterfaceParams mInterfaceParams;
+    @Mock private IpConnectivityLog mMetricsLog;
 
     private NetworkObserver mObserver;
     private InterfaceParams mIfParams;
@@ -139,6 +141,7 @@ public class IpClientTest {
         when(mDependencies.getInterfaceParams(any())).thenReturn(mInterfaceParams);
         when(mDependencies.getIpMemoryStore(mContext, mNetworkStackServiceManager))
                 .thenReturn(mIpMemoryStore);
+        when(mDependencies.getIpConnectivityLog()).thenReturn(mMetricsLog);
 
         mIfParams = null;
     }
@@ -354,7 +357,7 @@ public class IpClientTest {
         final String iface = TEST_IFNAME;
         final IpClient ipc = makeIpClient(iface);
         final String l2Key = TEST_L2KEY;
-        final String groupHint = TEST_GROUPHINT;
+        final String cluster = TEST_CLUSTER;
 
         ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
                 .withoutIPv4()
@@ -367,7 +370,7 @@ public class IpClientTest {
         verify(mCb, timeout(TEST_TIMEOUT_MS).times(1)).setNeighborDiscoveryOffload(true);
         verify(mCb, timeout(TEST_TIMEOUT_MS).times(1)).setFallbackMulticastFilter(false);
         verify(mCb, never()).onProvisioningFailure(any());
-        ipc.setL2KeyAndGroupHint(l2Key, groupHint);
+        ipc.setL2KeyAndCluster(l2Key, cluster);
 
         for (String addr : TEST_LOCAL_ADDRESSES) {
             String[] parts = addr.split("/");
@@ -391,7 +394,7 @@ public class IpClientTest {
         want.setInterfaceName(iface);
         verify(mCb, timeout(TEST_TIMEOUT_MS).times(1)).onProvisioningSuccess(want);
         verifyNetworkAttributesStored(l2Key, new NetworkAttributes.Builder()
-                .setGroupHint(groupHint)
+                .setCluster(cluster)
                 .build());
     }
 

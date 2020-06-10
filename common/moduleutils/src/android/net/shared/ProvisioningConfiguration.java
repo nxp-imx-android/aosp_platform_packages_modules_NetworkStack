@@ -68,12 +68,12 @@ public class ProvisioningConfiguration {
     // TODO: Delete this default timeout once those callers that care are
     // fixed to pass in their preferred timeout.
     //
-    // We pick 36 seconds so we can send DHCP requests at
+    // We pick 18 seconds so we can send DHCP requests at
     //
-    //     t=0, t=2, t=6, t=14, t=30
+    //     t=0, t=1, t=3, t=7, t=16
     //
     // allowing for 10% jitter.
-    private static final int DEFAULT_TIMEOUT_MS = 36 * 1000;
+    private static final int DEFAULT_TIMEOUT_MS = 18 * 1000;
 
     /**
      * Builder to create a {@link ProvisioningConfiguration}.
@@ -215,6 +215,14 @@ public class ProvisioningConfiguration {
          */
         public Builder withScanResultInfo(ScanResultInfo scanResultInfo) {
             mConfig.mScanResultInfo = scanResultInfo;
+            return this;
+        }
+
+        /**
+         * Specify the L2 information(bssid, l2key and cluster) that the IpClient should use.
+         */
+        public Builder withLayer2Information(Layer2Information layer2Info) {
+            mConfig.mLayer2Info = layer2Info;
             return this;
         }
 
@@ -421,6 +429,7 @@ public class ProvisioningConfiguration {
     public Network mNetwork = null;
     public String mDisplayName = null;
     public ScanResultInfo mScanResultInfo;
+    public Layer2Information mLayer2Info;
 
     public ProvisioningConfiguration() {} // used by Builder
 
@@ -441,6 +450,7 @@ public class ProvisioningConfiguration {
         mNetwork = other.mNetwork;
         mDisplayName = other.mDisplayName;
         mScanResultInfo = other.mScanResultInfo;
+        mLayer2Info = other.mLayer2Info;
     }
 
     /**
@@ -464,6 +474,7 @@ public class ProvisioningConfiguration {
         p.network = mNetwork;
         p.displayName = mDisplayName;
         p.scanResultInfo = mScanResultInfo == null ? null : mScanResultInfo.toStableParcelable();
+        p.layer2Info = mLayer2Info == null ? null : mLayer2Info.toStableParcelable();
         return p;
     }
 
@@ -490,6 +501,7 @@ public class ProvisioningConfiguration {
         config.mNetwork = p.network;
         config.mDisplayName = p.displayName;
         config.mScanResultInfo = ScanResultInfo.fromStableParcelable(p.scanResultInfo);
+        config.mLayer2Info = Layer2Information.fromStableParcelable(p.layer2Info);
         return config;
     }
 
@@ -510,6 +522,7 @@ public class ProvisioningConfiguration {
                 .add("mNetwork: " + mNetwork)
                 .add("mDisplayName: " + mDisplayName)
                 .add("mScanResultInfo: " + mScanResultInfo)
+                .add("mLayer2Info: " + mLayer2Info)
                 .toString();
     }
 
@@ -530,7 +543,8 @@ public class ProvisioningConfiguration {
                 && mIPv6AddrGenMode == other.mIPv6AddrGenMode
                 && Objects.equals(mNetwork, other.mNetwork)
                 && Objects.equals(mDisplayName, other.mDisplayName)
-                && Objects.equals(mScanResultInfo, other.mScanResultInfo);
+                && Objects.equals(mScanResultInfo, other.mScanResultInfo)
+                && Objects.equals(mLayer2Info, other.mLayer2Info);
     }
 
     public boolean isValid() {

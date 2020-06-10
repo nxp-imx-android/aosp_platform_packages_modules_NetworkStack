@@ -29,6 +29,7 @@ import static android.net.shared.Inet4AddressUtils.getBroadcastAddress;
 import static android.net.shared.Inet4AddressUtils.getPrefixMaskAsInet4Address;
 import static android.net.shared.IpConfigurationParcelableUtil.fromStableParcelable;
 import static android.system.OsConstants.ETH_P_IPV6;
+import static android.system.OsConstants.IFA_F_TEMPORARY;
 import static android.system.OsConstants.IPPROTO_ICMPV6;
 import static android.system.OsConstants.IPPROTO_TCP;
 
@@ -60,11 +61,15 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.contains;
+import static org.mockito.ArgumentMatchers.longThat;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.spy;
@@ -74,6 +79,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import android.app.AlarmManager;
+import android.app.AlarmManager.OnAlarmListener;
 import android.app.Instrumentation;
 import android.content.ContentResolver;
 import android.content.Context;
@@ -103,6 +109,8 @@ import android.net.dhcp.DhcpRequestPacket;
 import android.net.ipmemorystore.NetworkAttributes;
 import android.net.ipmemorystore.OnNetworkAttributesRetrievedListener;
 import android.net.ipmemorystore.Status;
+import android.net.netlink.StructNdOptPref64;
+import android.net.shared.Layer2Information;
 import android.net.shared.ProvisioningConfiguration;
 import android.net.shared.ProvisioningConfiguration.ScanResultInfo;
 import android.net.util.InterfaceParams;
@@ -114,6 +122,7 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.PowerManager;
 import android.os.RemoteException;
+import android.os.SystemClock;
 import android.os.SystemProperties;
 import android.system.ErrnoException;
 import android.system.Os;
@@ -124,20 +133,27 @@ import androidx.test.runner.AndroidJUnit4;
 
 import com.android.internal.util.StateMachine;
 import com.android.networkstack.apishim.CaptivePortalDataShimImpl;
-import com.android.networkstack.apishim.ShimUtils;
+import com.android.networkstack.apishim.ConstantsShim;
+import com.android.networkstack.apishim.common.ShimUtils;
 import com.android.networkstack.arp.ArpPacket;
+import com.android.server.NetworkObserver;
 import com.android.server.NetworkObserverRegistry;
 import com.android.server.NetworkStackService.NetworkStackServiceManager;
 import com.android.server.connectivity.ipmemorystore.IpMemoryStoreService;
+import com.android.testutils.DevSdkIgnoreRule;
+import com.android.testutils.DevSdkIgnoreRule.IgnoreAfter;
 import com.android.testutils.DevSdkIgnoreRule.IgnoreUpTo;
 import com.android.testutils.HandlerUtilsKt;
 import com.android.testutils.TapPacketReader;
 
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Ignore;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.mockito.Spy;
@@ -156,6 +172,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.Random;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 
 /**
  * Tests for IpClient.
@@ -167,8 +188,14 @@ public class IpClientIntegrationTest {
     private static final int PACKET_TIMEOUT_MS = 5_000;
     private static final int TEST_TIMEOUT_MS = 400;
     private static final String TEST_L2KEY = "some l2key";
-    private static final String TEST_GROUPHINT = "some grouphint";
+    private static final String TEST_CLUSTER = "some cluster";
     private static final int TEST_LEASE_DURATION_S = 3_600; // 1 hour
+
+    // TODO: move to NetlinkConstants, NetworkStackConstants, or OsConstants.
+    private static final int IFA_F_STABLE_PRIVACY = 0x800;
+
+    @Rule
+    public final DevSdkIgnoreRule mIgnoreRule = new DevSdkIgnoreRule();
 
     @Mock private Context mContext;
     @Mock private ConnectivityManager mCm;
@@ -184,6 +211,7 @@ public class IpClientIntegrationTest {
     @Spy private INetd mNetd;
 
     private String mIfaceName;
+    private NetworkObserverRegistry mNetworkObserverRegistry;
     private HandlerThread mPacketReaderThread;
     private Handler mHandler;
     private TapPacketReader mPacketReader;
@@ -241,7 +269,7 @@ public class IpClientIntegrationTest {
     private static final String TEST_DHCP_ROAM_SSID = "0001docomo";
     private static final String TEST_DHCP_ROAM_BSSID = "00:4e:35:17:98:55";
     private static final String TEST_DHCP_ROAM_L2KEY = "roaming_l2key";
-    private static final String TEST_DHCP_ROAM_GROUPHINT = "roaming_group_hint";
+    private static final String TEST_DHCP_ROAM_CLUSTER = "roaming_cluster";
     private static final byte[] TEST_AP_OUI = new byte[] { 0x00, 0x1A, 0x11 };
 
     private class Dependencies extends IpClient.Dependencies {
@@ -294,7 +322,8 @@ public class IpClientIntegrationTest {
                 NetworkStackIpMemoryStore ipMemoryStore) {
             return new DhcpClient.Dependencies(ipMemoryStore) {
                 @Override
-                public boolean isFeatureEnabled(final Context context, final String name) {
+                public boolean isFeatureEnabled(final Context context, final String name,
+                        final boolean defaultEnabled) {
                     switch (name) {
                         case NetworkStackUtils.DHCP_RAPID_COMMIT_VERSION:
                             return mIsDhcpRapidCommitEnabled;
@@ -407,7 +436,13 @@ public class IpClientIntegrationTest {
         mPacketReaderThread.start();
         mHandler = mPacketReaderThread.getThreadHandler();
 
-        mTapFd = iface.getFileDescriptor().getFileDescriptor();
+        // Detach the FileDescriptor from the ParcelFileDescriptor.
+        // Otherwise, the garbage collector might call the ParcelFileDescriptor's finalizer, which
+        // closes the FileDescriptor and destroys our tap interface. An alternative would be to
+        // make the ParcelFileDescriptor or the TestNetworkInterface a class member so they never
+        // go out of scope.
+        mTapFd = new FileDescriptor();
+        mTapFd.setInt$(iface.getFileDescriptor().detachFd());
         mPacketReader = new TapPacketReader(mHandler, mTapFd, DATA_BUFFER_LEN);
         mHandler.post(() -> mPacketReader.start());
     }
@@ -420,10 +455,54 @@ public class IpClientIntegrationTest {
         when(mContext.getSystemService(eq(Context.NETD_SERVICE))).thenReturn(netdIBinder);
         assertNotNull(mNetd);
 
-        final NetworkObserverRegistry reg = new NetworkObserverRegistry();
-        reg.register(mNetd);
-        mIpc = new IpClient(mContext, mIfaceName, mCb, reg, mNetworkStackServiceManager,
-                mDependencies);
+        mNetworkObserverRegistry = new NetworkObserverRegistry();
+        mNetworkObserverRegistry.register(mNetd);
+        mIpc = new IpClient(mContext, mIfaceName, mCb, mNetworkObserverRegistry,
+                mNetworkStackServiceManager, mDependencies);
+        // Wait for IpClient to enter its initial state. Otherwise, additional setup steps or tests
+        // that mock IpClient's dependencies might interact with those mocks while IpClient is
+        // starting. This would cause UnfinishedStubbingExceptions as mocks cannot be interacted
+        // with while they are being stubbed.
+        HandlerUtilsKt.waitForIdle(mIpc.getHandler(), TEST_TIMEOUT_MS);
+
+        // Tell the IpMemoryStore immediately to answer any question about network attributes with a
+        // null response. Otherwise, the DHCP client will wait for two seconds before starting,
+        // while its query to the IpMemoryStore times out.
+        // This does not affect any test that makes the mock memory store return results, because
+        // unlike when(), it is documented that doAnswer() can be called more than once, to change
+        // the behaviour of a mock in the middle of a test.
+        doAnswer(invocation -> {
+            final String l2Key = invocation.getArgument(0);
+            ((OnNetworkAttributesRetrievedListener) invocation.getArgument(1))
+                    .onNetworkAttributesRetrieved(new Status(SUCCESS), l2Key, null);
+            return null;
+        }).when(mIpMemoryStore).retrieveNetworkAttributes(any(), any());
+
+        disableIpv6ProvisioningDelays();
+    }
+
+    private <T> T verifyWithTimeout(InOrder inOrder, T t) {
+        if (inOrder != null) {
+            return inOrder.verify(t, timeout(TEST_TIMEOUT_MS));
+        } else {
+            return verify(t, timeout(TEST_TIMEOUT_MS));
+        }
+    }
+
+    private void expectAlarmCancelled(InOrder inOrder, OnAlarmListener listener) {
+        inOrder.verify(mAlarm, timeout(TEST_TIMEOUT_MS)).cancel(eq(listener));
+    }
+
+    private OnAlarmListener expectAlarmSet(InOrder inOrder, String tagMatch, int afterSeconds) {
+        // Allow +/- 3 seconds to prevent flaky tests.
+        final long when = SystemClock.elapsedRealtime() + afterSeconds * 1000;
+        final long min = when - 3 * 1000;
+        final long max = when + 3 * 1000;
+        ArgumentCaptor<OnAlarmListener> captor = ArgumentCaptor.forClass(OnAlarmListener.class);
+        verifyWithTimeout(inOrder, mAlarm).setExact(
+                anyInt(), longThat(x -> x >= min && x <= max),
+                contains(tagMatch), captor.capture(), eq(mIpc.getHandler()));
+        return captor.getValue();
     }
 
     private boolean packetContainsExpectedField(final byte[] packet, final int offset,
@@ -521,27 +600,20 @@ public class IpClientIntegrationTest {
             final boolean isHostnameConfigurationEnabled, final String hostname,
             final String displayName, final ScanResultInfo scanResultInfo)
             throws RemoteException {
-        ProvisioningConfiguration.Builder builder = new ProvisioningConfiguration.Builder()
+        ProvisioningConfiguration.Builder prov = new ProvisioningConfiguration.Builder()
                 .withoutIpReachabilityMonitor()
+                .withLayer2Information(new Layer2Information(TEST_L2KEY, TEST_CLUSTER,
+                        MacAddress.fromString(TEST_DEFAULT_BSSID)))
                 .withoutIPv6();
-        if (isPreconnectionEnabled) builder.withPreconnection();
-        if (displayName != null) builder.withDisplayName(displayName);
-        if (scanResultInfo != null) builder.withScanResultInfo(scanResultInfo);
+        if (isPreconnectionEnabled) prov.withPreconnection();
+        if (displayName != null) prov.withDisplayName(displayName);
+        if (scanResultInfo != null) prov.withScanResultInfo(scanResultInfo);
 
         mDependencies.setDhcpLeaseCacheEnabled(isDhcpLeaseCacheEnabled);
         mDependencies.setDhcpRapidCommitEnabled(shouldReplyRapidCommitAck);
         mDependencies.setDhcpIpConflictDetectEnabled(isDhcpIpConflictDetectEnabled);
         mDependencies.setHostnameConfiguration(isHostnameConfigurationEnabled, hostname);
-
-        if (ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q)) {
-            final Layer2InformationParcelable info = new Layer2InformationParcelable();
-            info.l2Key = TEST_L2KEY;
-            info.groupHint = TEST_GROUPHINT;
-            mIpc.updateLayer2Information(info);
-        } else {
-            mIpc.setL2KeyAndGroupHint(TEST_L2KEY, TEST_GROUPHINT);
-        }
-        mIpc.startProvisioning(builder.build());
+        mIpc.startProvisioning(prov.build());
         if (!isPreconnectionEnabled) {
             verify(mCb, timeout(TEST_TIMEOUT_MS)).setFallbackMulticastFilter(false);
         }
@@ -598,7 +670,7 @@ public class IpClientIntegrationTest {
     }
 
     private void assertNoHostname(String hostname) {
-        if (ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q)) {
+        if (ShimUtils.isAtLeastR()) {
             assertNull(hostname);
         } else {
             // Until Q, if no hostname is set, the device falls back to the hostname set via
@@ -619,13 +691,12 @@ public class IpClientIntegrationTest {
                 false /* isPreconnectionEnabled */, isDhcpIpConflictDetectEnabled,
                 isHostnameConfigurationEnabled, hostname, displayName, scanResultInfo);
         return handleDhcpPackets(isSuccessLease, leaseTimeSec, shouldReplyRapidCommitAck, mtu,
-                isDhcpIpConflictDetectEnabled, captivePortalApiUrl);
+                captivePortalApiUrl);
     }
 
     private List<DhcpPacket> handleDhcpPackets(final boolean isSuccessLease,
             final Integer leaseTimeSec, final boolean shouldReplyRapidCommitAck, final int mtu,
-            final boolean isDhcpIpConflictDetectEnabled, final String captivePortalApiUrl)
-            throws Exception {
+            final String captivePortalApiUrl) throws Exception {
         final List<DhcpPacket> packetList = new ArrayList<>();
         DhcpPacket packet;
         while ((packet = getNextDhcpPacket()) != null) {
@@ -650,15 +721,6 @@ public class IpClientIntegrationTest {
 
             // wait for reply to DHCPOFFER packet if disabling rapid commit option
             if (shouldReplyRapidCommitAck || !(packet instanceof DhcpDiscoverPacket)) {
-                if (!isDhcpIpConflictDetectEnabled && isSuccessLease) {
-                    // verify IPv4-only provisioning success before exiting loop.
-                    // 1. if it's a failure lease, onProvisioningSuccess() won't be called;
-                    // 2. if duplicated IPv4 address detection is enabled, verify TIMEOUT
-                    //    will affect ARP packet capture running in other test cases.
-                    ArgumentCaptor<LinkProperties> captor =
-                            ArgumentCaptor.forClass(LinkProperties.class);
-                    verifyProvisioningSuccess(captor, Collections.singletonList(CLIENT_ADDR));
-                }
                 return packetList;
             }
         }
@@ -720,8 +782,15 @@ public class IpClientIntegrationTest {
         verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(emptyLp);
     }
 
-    private void verifyProvisioningSuccess(ArgumentCaptor<LinkProperties> captor,
-            final Collection<InetAddress> addresses) throws Exception {
+    // Verify IPv4-only provisioning success. No need to verify IPv4 provisioning when below cases
+    // happen:
+    // 1. if there's a failure lease, onProvisioningSuccess() won't be called;
+    // 2. if duplicated IPv4 address detection is enabled, verify TIMEOUT will affect ARP packets
+    //    capture running in other test cases.
+    // 3. if IPv6 is enabled, e.g. withoutIPv6() isn't called when starting provisioning.
+    private void verifyIPv4OnlyProvisioningSuccess(final Collection<InetAddress> addresses)
+            throws Exception {
+        final ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
         verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningSuccess(captor.capture());
         LinkProperties lp = captor.getValue();
         assertNotNull(lp);
@@ -739,6 +808,7 @@ public class IpClientIntegrationTest {
         performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
                 true /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
                 mtu, false /* isDhcpIpConflictDetectEnabled */);
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, mtu);
 
         if (shouldChangeMtu) {
@@ -770,27 +840,32 @@ public class IpClientIntegrationTest {
         }
     }
 
+    private DhcpPacket assertDiscoverPacketOnPreconnectionStart() throws Exception {
+        final ArgumentCaptor<List<Layer2PacketParcelable>> l2PacketList =
+                ArgumentCaptor.forClass(List.class);
+
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onPreconnectionStart(l2PacketList.capture());
+        final byte[] payload = l2PacketList.getValue().get(0).payload;
+        DhcpPacket packet = DhcpPacket.decodeFullPacket(payload, payload.length, ENCAP_L2);
+        assertTrue(packet instanceof DhcpDiscoverPacket);
+        assertArrayEquals(INADDR_BROADCAST.getAddress(),
+                Arrays.copyOfRange(payload, IPV4_DST_ADDR_OFFSET, IPV4_DST_ADDR_OFFSET + 4));
+        return packet;
+    }
+
     private void doIpClientProvisioningWithPreconnectionTest(
             final boolean shouldReplyRapidCommitAck, final boolean shouldAbortPreconnection,
             final boolean shouldFirePreconnectionTimeout,
             final boolean timeoutBeforePreconnectionComplete) throws Exception {
         final long currentTime = System.currentTimeMillis();
-        final ArgumentCaptor<List<Layer2PacketParcelable>> l2PacketList =
-                ArgumentCaptor.forClass(List.class);
         final ArgumentCaptor<InterfaceConfigurationParcel> ifConfig =
                 ArgumentCaptor.forClass(InterfaceConfigurationParcel.class);
 
         startIpClientProvisioning(true /* isDhcpLeaseCacheEnabled */,
                 shouldReplyRapidCommitAck, true /* isDhcpPreConnectionEnabled */,
                 false /* isDhcpIpConflictDetectEnabled */);
-        verify(mCb, timeout(TEST_TIMEOUT_MS).times(1))
-                .onPreconnectionStart(l2PacketList.capture());
-        final byte[] payload = l2PacketList.getValue().get(0).payload;
-        DhcpPacket packet = DhcpPacket.decodeFullPacket(payload, payload.length, ENCAP_L2);
+        DhcpPacket packet = assertDiscoverPacketOnPreconnectionStart();
         final int preconnDiscoverTransId = packet.getTransactionId();
-        assertTrue(packet instanceof DhcpDiscoverPacket);
-        assertArrayEquals(INADDR_BROADCAST.getAddress(),
-                Arrays.copyOfRange(payload, IPV4_DST_ADDR_OFFSET, IPV4_DST_ADDR_OFFSET + 4));
 
         if (shouldAbortPreconnection) {
             if (shouldFirePreconnectionTimeout && timeoutBeforePreconnectionComplete) {
@@ -921,9 +996,8 @@ public class IpClientIntegrationTest {
             assertEquals(5, packetList.size());
             assertArpProbe(packetList.get(0));
             assertArpAnnounce(packetList.get(3));
-
-            ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
-            verifyProvisioningSuccess(captor, Collections.singletonList(CLIENT_ADDR));
+        } else {
+            verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
             assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime,
                     TEST_DEFAULT_MTU);
         }
@@ -962,6 +1036,7 @@ public class IpClientIntegrationTest {
         performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
                 true /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
                 TEST_DEFAULT_MTU, false /* isDhcpIpConflictDetectEnabled */);
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
 
@@ -981,6 +1056,7 @@ public class IpClientIntegrationTest {
         performDhcpHandshake(true /* isSuccessLease */, INFINITE_LEASE,
                 true /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
                 TEST_DEFAULT_MTU, false /* isDhcpIpConflictDetectEnabled */);
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertIpMemoryStoreNetworkAttributes(INFINITE_LEASE, currentTime, TEST_DEFAULT_MTU);
     }
 
@@ -990,14 +1066,16 @@ public class IpClientIntegrationTest {
         performDhcpHandshake(true /* isSuccessLease */, null /* no lease time */,
                 true /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
                 TEST_DEFAULT_MTU, false /* isDhcpIpConflictDetectEnabled */);
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertIpMemoryStoreNetworkAttributes(null, currentTime, TEST_DEFAULT_MTU);
     }
 
-    @Test
+    @Test @IgnoreAfter(Build.VERSION_CODES.Q) // INIT-REBOOT is enabled on R.
     public void testHandleDisableInitRebootState() throws Exception {
         performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
                 false /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
                 TEST_DEFAULT_MTU, false /* isDhcpIpConflictDetectEnabled */);
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertIpMemoryNeverStoreNetworkAttributes();
     }
 
@@ -1007,6 +1085,7 @@ public class IpClientIntegrationTest {
         performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
                 true /* isDhcpLeaseCacheEnabled */, true /* shouldReplyRapidCommitAck */,
                 TEST_DEFAULT_MTU, false /* isDhcpIpConflictDetectEnabled */);
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
 
@@ -1017,7 +1096,7 @@ public class IpClientIntegrationTest {
                     .setAssignedV4Address(CLIENT_ADDR)
                     .setAssignedV4AddressExpiry(Long.MAX_VALUE) // lease is always valid
                     .setMtu(new Integer(TEST_DEFAULT_MTU))
-                    .setGroupHint(TEST_GROUPHINT)
+                    .setCluster(TEST_CLUSTER)
                     .setDnsAddresses(Collections.singletonList(SERVER_ADDR))
                     .build(), false /* timeout */);
         assertTrue(packet instanceof DhcpRequestPacket);
@@ -1030,7 +1109,7 @@ public class IpClientIntegrationTest {
                     .setAssignedV4Address(CLIENT_ADDR)
                     .setAssignedV4AddressExpiry(EXPIRED_LEASE)
                     .setMtu(new Integer(TEST_DEFAULT_MTU))
-                    .setGroupHint(TEST_GROUPHINT)
+                    .setCluster(TEST_CLUSTER)
                     .setDnsAddresses(Collections.singletonList(SERVER_ADDR))
                     .build(), false /* timeout */);
         assertTrue(packet instanceof DhcpDiscoverPacket);
@@ -1049,7 +1128,7 @@ public class IpClientIntegrationTest {
                     .setAssignedV4Address(CLIENT_ADDR)
                     .setAssignedV4AddressExpiry(System.currentTimeMillis() + 3_600_000)
                     .setMtu(new Integer(TEST_DEFAULT_MTU))
-                    .setGroupHint(TEST_GROUPHINT)
+                    .setCluster(TEST_CLUSTER)
                     .setDnsAddresses(Collections.singletonList(SERVER_ADDR))
                     .build(), true /* timeout */);
         assertTrue(packet instanceof DhcpDiscoverPacket);
@@ -1060,7 +1139,7 @@ public class IpClientIntegrationTest {
         final DhcpPacket packet = getReplyFromDhcpLease(
                 new NetworkAttributes.Builder()
                     .setMtu(new Integer(TEST_DEFAULT_MTU))
-                    .setGroupHint(TEST_GROUPHINT)
+                    .setCluster(TEST_CLUSTER)
                     .setDnsAddresses(Collections.singletonList(SERVER_ADDR))
                     .build(), false /* timeout */);
         assertTrue(packet instanceof DhcpDiscoverPacket);
@@ -1077,6 +1156,8 @@ public class IpClientIntegrationTest {
 
     @Test @IgnoreUpTo(Build.VERSION_CODES.Q)
     public void testDhcpServerInLinkProperties() throws Exception {
+        assumeTrue(ConstantsShim.VERSION > Build.VERSION_CODES.Q);
+
         performDhcpHandshake();
         ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
         verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningSuccess(captor.capture());
@@ -1128,6 +1209,7 @@ public class IpClientIntegrationTest {
         performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
                 true /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
                 TEST_MIN_MTU, false /* isDhcpIpConflictDetectEnabled */);
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_MIN_MTU);
 
         // Pretend that ConnectivityService set the MTU.
@@ -1144,6 +1226,7 @@ public class IpClientIntegrationTest {
         performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
                 true /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
                 0 /* mtu */, false /* isDhcpIpConflictDetectEnabled */);
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, 0 /* mtu */);
         assertEquals(NetworkInterface.getByName(mIfaceName).getMTU(), TEST_DEFAULT_MTU);
     }
@@ -1162,6 +1245,27 @@ public class IpClientIntegrationTest {
             if (isRouterSolicitation(packet)) return;
         }
         fail("No router solicitation received on interface within timeout");
+    }
+
+    private void sendRouterAdvertisement(boolean waitForRs, short lifetime) throws Exception {
+        final String dnsServer = "2001:4860:4860::64";
+        final ByteBuffer pio = buildPioOption(3600, 1800, "2001:db8:1::/64");
+        ByteBuffer rdnss = buildRdnssOption(3600, dnsServer);
+        ByteBuffer ra = buildRaPacket(lifetime, pio, rdnss);
+
+        if (waitForRs) {
+            waitForRouterSolicitation();
+        }
+
+        mPacketReader.sendResponse(ra);
+    }
+
+    private void sendBasicRouterAdvertisement(boolean waitForRs) throws Exception {
+        sendRouterAdvertisement(waitForRs, (short) 1800);
+    }
+
+    private void sendRouterAdvertisementWithZeroLifetime() throws Exception {
+        sendRouterAdvertisement(false /* waitForRs */, (short) 0);
     }
 
     // TODO: move this and the following method to a common location and use them in ApfTest.
@@ -1225,7 +1329,8 @@ public class IpClientIntegrationTest {
         return checksumAdjust(checksum, (short) IPPROTO_TCP, (short) IPPROTO_ICMPV6);
     }
 
-    private static ByteBuffer buildRaPacket(ByteBuffer... options) throws Exception {
+    private static ByteBuffer buildRaPacket(short lifetime, ByteBuffer... options)
+            throws Exception {
         final MacAddress srcMac = MacAddress.fromString("33:33:00:00:00:01");
         final MacAddress dstMac = MacAddress.fromString("01:02:03:04:05:06");
         final byte[] routerLinkLocal = InetAddresses.parseNumericAddress("fe80::1").getAddress();
@@ -1253,7 +1358,7 @@ public class IpClientIntegrationTest {
         packet.putShort((short) 0);                      // Checksum, TBD
         packet.put((byte) 0);                            // Hop limit, unspecified
         packet.put((byte) 0);                            // M=0, O=0
-        packet.putShort((short) 1800);                   // Router lifetime
+        packet.putShort(lifetime);                       // Router lifetime
         packet.putInt(0);                                // Reachable time, unspecified
         packet.putInt(100);                              // Retrans time 100ms.
 
@@ -1273,18 +1378,84 @@ public class IpClientIntegrationTest {
         return packet;
     }
 
+    private static ByteBuffer buildRaPacket(ByteBuffer... options) throws Exception {
+        return buildRaPacket((short) 1800, options);
+    }
+
+    private void disableIpv6ProvisioningDelays() throws Exception {
+        // Speed up the test by disabling DAD and removing router_solicitation_delay.
+        // We don't need to restore the default value because the interface is removed in tearDown.
+        // TODO: speed up further by not waiting for RS but keying off first IPv6 packet.
+        mNetd.setProcSysNet(INetd.IPV6, INetd.CONF, mIfaceName, "router_solicitation_delay", "0");
+        mNetd.setProcSysNet(INetd.IPV6, INetd.CONF, mIfaceName, "dad_transmits", "0");
+    }
+
+    private void assertHasAddressThat(String msg, LinkProperties lp,
+            Predicate<LinkAddress> condition) {
+        for (LinkAddress addr : lp.getLinkAddresses()) {
+            if (condition.test(addr)) {
+                return;
+            }
+        }
+        fail(msg + " not found in: " + lp);
+    }
+
+    private boolean hasFlag(LinkAddress addr, int flag) {
+        return (addr.getFlags() & flag) == flag;
+    }
+
+    private boolean isPrivacyAddress(LinkAddress addr) {
+        return addr.isGlobalPreferred() && hasFlag(addr, IFA_F_TEMPORARY);
+    }
+
+    private boolean isStablePrivacyAddress(LinkAddress addr) {
+        // TODO: move away from getting address updates from netd and make this work on Q as well.
+        final int flag = ShimUtils.isAtLeastR() ? IFA_F_STABLE_PRIVACY : 0;
+        return addr.isGlobalPreferred() && hasFlag(addr, flag);
+    }
+
+    private LinkProperties doIpv6OnlyProvisioning(InOrder inOrder, ByteBuffer ra) throws Exception {
+        waitForRouterSolicitation();
+        mPacketReader.sendResponse(ra);
+
+        // The lambda below needs to write a LinkProperties to a local variable, but lambdas cannot
+        // write to non-final local variables. So declare a final variable to write to.
+        final AtomicReference<LinkProperties> lpRef = new AtomicReference<>();
+
+        ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
+        verifyWithTimeout(inOrder, mCb).onProvisioningSuccess(captor.capture());
+        lpRef.set(captor.getValue());
+
+        // Sometimes provisioning completes as soon as the link-local and the stable address appear,
+        // before the privacy address appears. If so, wait here for the LinkProperties update that
+        // contains all three address. Otherwise, future calls to verify() might get confused.
+        if (captor.getValue().getLinkAddresses().size() == 2) {
+            verifyWithTimeout(inOrder, mCb).onLinkPropertiesChange(argThat(lp -> {
+                lpRef.set(lp);
+                return lp.getLinkAddresses().size() == 3;
+            }));
+        }
+
+        LinkProperties lp = lpRef.get();
+        assertEquals("Should have 3 IPv6 addresses after provisioning: " + lp,
+                3, lp.getLinkAddresses().size());
+        assertHasAddressThat("link-local address", lp, x -> x.getAddress().isLinkLocalAddress());
+        assertHasAddressThat("privacy address", lp, this::isPrivacyAddress);
+        assertHasAddressThat("stable privacy address", lp, this::isStablePrivacyAddress);
+
+        return lp;
+    }
+
     @Test
     public void testRaRdnss() throws Exception {
-        // Speed up the test by removing router_solicitation_delay.
-        // We don't need to restore the default value because the interface is removed in tearDown.
-        // TODO: speed up further by not waiting for RA but keying off first IPv6 packet.
-        mNetd.setProcSysNet(INetd.IPV6, INetd.CONF, mIfaceName, "router_solicitation_delay", "0");
-
         ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
                 .withoutIpReachabilityMonitor()
                 .withoutIPv4()
                 .build();
         mIpc.startProvisioning(config);
+
+        InOrder inOrder = inOrder(mCb);
+        ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
 
         final String dnsServer = "2001:4860:4860::64";
         final String lowlifeDnsServer = "2001:4860:4860::6464";
@@ -1294,30 +1465,23 @@ public class IpClientIntegrationTest {
         ByteBuffer rdnss2 = buildRdnssOption(600, dnsServer);
         ByteBuffer ra = buildRaPacket(pio, rdnss1, rdnss2);
 
-        waitForRouterSolicitation();
-        mPacketReader.sendResponse(ra);
-
-        ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
-        verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningSuccess(captor.capture());
-        LinkProperties lp = captor.getValue();
+        LinkProperties lp = doIpv6OnlyProvisioning(inOrder, ra);
 
         // Expect that DNS servers with lifetimes below CONFIG_MIN_RDNSS_LIFETIME are not accepted.
         assertNotNull(lp);
         assertEquals(1, lp.getDnsServers().size());
         assertTrue(lp.getDnsServers().contains(InetAddress.getByName(dnsServer)));
-        reset(mCb);
 
         // If the RDNSS lifetime is above the minimum, the DNS server is accepted.
         rdnss1 = buildRdnssOption(68, lowlifeDnsServer);
         ra = buildRaPacket(pio, rdnss1, rdnss2);
         mPacketReader.sendResponse(ra);
-        verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(captor.capture());
+        inOrder.verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(captor.capture());
         lp = captor.getValue();
         assertNotNull(lp);
         assertEquals(2, lp.getDnsServers().size());
         assertTrue(lp.getDnsServers().contains(InetAddress.getByName(dnsServer)));
         assertTrue(lp.getDnsServers().contains(InetAddress.getByName(lowlifeDnsServer)));
-        reset(mCb);
 
         // Expect that setting RDNSS lifetime of 0 causes loss of provisioning.
         rdnss1 = buildRdnssOption(0, dnsServer);
@@ -1325,11 +1489,182 @@ public class IpClientIntegrationTest {
         ra = buildRaPacket(pio, rdnss1, rdnss2);
         mPacketReader.sendResponse(ra);
 
-        verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningFailure(captor.capture());
+        inOrder.verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningFailure(captor.capture());
         lp = captor.getValue();
         assertNotNull(lp);
         assertEquals(0, lp.getDnsServers().size());
         reset(mCb);
+    }
+
+    private void expectNat64PrefixUpdate(InOrder inOrder, IpPrefix expected) throws Exception {
+        inOrder.verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(
+                argThat(lp -> Objects.equals(expected, lp.getNat64Prefix())));
+
+    }
+
+    private void expectNoNat64PrefixUpdate(InOrder inOrder, IpPrefix unchanged) throws Exception {
+        inOrder.verify(mCb, timeout(TEST_TIMEOUT_MS).times(0)).onLinkPropertiesChange(argThat(
+                lp -> !Objects.equals(unchanged, lp.getNat64Prefix())));
+
+    }
+
+    @Ignore  // AOSP kernels don't support the PREF64 option yet.
+    @Test @IgnoreUpTo(Build.VERSION_CODES.Q)
+    public void testPref64Option() throws Exception {
+        assumeTrue(ConstantsShim.VERSION > Build.VERSION_CODES.Q);
+
+        ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
+                .withoutIpReachabilityMonitor()
+                .withoutIPv4()
+                .build();
+        mIpc.startProvisioning(config);
+
+        final String dnsServer = "2001:4860:4860::64";
+        final IpPrefix prefix = new IpPrefix("64:ff9b::/96");
+        final IpPrefix otherPrefix = new IpPrefix("2001:db8:64::/96");
+
+        final ByteBuffer pio = buildPioOption(600, 300, "2001:db8:1::/64");
+        ByteBuffer rdnss = buildRdnssOption(600, dnsServer);
+        ByteBuffer pref64 = new StructNdOptPref64(prefix, 600).toByteBuffer();
+        ByteBuffer ra = buildRaPacket(pio, rdnss, pref64);
+
+        waitForRouterSolicitation();
+        mPacketReader.sendResponse(ra);
+
+        // The NAT64 prefix might be detected before or after provisioning success.
+        // Don't test order between these two events.
+        ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
+        verifyWithTimeout(null /*inOrder*/, mCb).onProvisioningSuccess(captor.capture());
+        expectAlarmSet(null /*inOrder*/, "PREF64", 600);
+        reset(mCb, mAlarm);
+
+        // From now on expect events in order.
+        InOrder inOrder = inOrder(mCb, mAlarm);
+
+        LinkProperties lp = captor.getValue();
+        if (lp.getNat64Prefix() != null) {
+            assertEquals(prefix, lp.getNat64Prefix());
+        } else {
+            expectNat64PrefixUpdate(inOrder, prefix);
+        }
+
+        // Increase the lifetime and expect the prefix not to change.
+        pref64 = new StructNdOptPref64(prefix, 1800).toByteBuffer();
+        ra = buildRaPacket(pio, rdnss, pref64);
+        mPacketReader.sendResponse(ra);
+        OnAlarmListener pref64Alarm = expectAlarmSet(inOrder, "PREF64", 1800);
+        expectNoNat64PrefixUpdate(inOrder, prefix);
+        reset(mCb, mAlarm);
+
+        // Reduce the lifetime and expect to reschedule expiry.
+        pref64 = new StructNdOptPref64(prefix, 1500).toByteBuffer();
+        ra = buildRaPacket(pio, rdnss, pref64);
+        mPacketReader.sendResponse(ra);
+        pref64Alarm = expectAlarmSet(inOrder, "PREF64", 1496);
+        expectNoNat64PrefixUpdate(inOrder, prefix);
+        reset(mCb, mAlarm);
+
+        // Withdraw the prefix and expect it to be set to null.
+        pref64 = new StructNdOptPref64(prefix, 0).toByteBuffer();
+        ra = buildRaPacket(pio, rdnss, pref64);
+        mPacketReader.sendResponse(ra);
+        expectAlarmCancelled(inOrder, pref64Alarm);
+        expectNat64PrefixUpdate(inOrder, null);
+        reset(mCb, mAlarm);
+
+        // Re-announce the prefix.
+        pref64 = new StructNdOptPref64(prefix, 600).toByteBuffer();
+        ra = buildRaPacket(pio, rdnss, pref64);
+        mPacketReader.sendResponse(ra);
+        expectAlarmSet(inOrder, "PREF64", 600);
+        expectNat64PrefixUpdate(inOrder, prefix);
+        reset(mCb, mAlarm);
+
+        // Announce two prefixes. Don't expect any update because if there is already a NAT64
+        // prefix, any new prefix is ignored.
+        ByteBuffer otherPref64 = new StructNdOptPref64(otherPrefix, 1200).toByteBuffer();
+        ra = buildRaPacket(pio, rdnss, pref64, otherPref64);
+        mPacketReader.sendResponse(ra);
+        expectAlarmSet(inOrder, "PREF64", 600);
+        expectNoNat64PrefixUpdate(inOrder, prefix);
+        reset(mCb, mAlarm);
+
+        // Withdraw the old prefix and continue to announce the new one. Expect a prefix change.
+        pref64 = new StructNdOptPref64(prefix, 0).toByteBuffer();
+        ra = buildRaPacket(pio, rdnss, pref64, otherPref64);
+        mPacketReader.sendResponse(ra);
+        expectAlarmCancelled(inOrder, pref64Alarm);
+        // Need a different OnAlarmListener local variable because posting it to the handler in the
+        // lambda below requires it to be final.
+        final OnAlarmListener lastAlarm = expectAlarmSet(inOrder, "PREF64", 1200);
+        expectNat64PrefixUpdate(inOrder, otherPrefix);
+        reset(mCb, mAlarm);
+
+        // Simulate prefix expiry.
+        mIpc.getHandler().post(() -> lastAlarm.onAlarm());
+        expectAlarmCancelled(inOrder, pref64Alarm);
+        expectNat64PrefixUpdate(inOrder, null);
+
+        // Announce a non-/96 prefix and expect it to be ignored.
+        IpPrefix invalidPrefix = new IpPrefix("64:ff9b::/64");
+        pref64 = new StructNdOptPref64(invalidPrefix, 1200).toByteBuffer();
+        ra = buildRaPacket(pio, rdnss, pref64);
+        mPacketReader.sendResponse(ra);
+        expectNoNat64PrefixUpdate(inOrder, invalidPrefix);
+
+        // Re-announce the prefix.
+        pref64 = new StructNdOptPref64(prefix, 600).toByteBuffer();
+        ra = buildRaPacket(pio, rdnss, pref64);
+        mPacketReader.sendResponse(ra);
+        final OnAlarmListener clearAlarm = expectAlarmSet(inOrder, "PREF64", 600);
+        expectNat64PrefixUpdate(inOrder, prefix);
+        reset(mCb, mAlarm);
+
+        // Check that the alarm is cancelled when IpClient is stopped.
+        mIpc.stop();
+        HandlerUtilsKt.waitForIdle(mIpc.getHandler(), TEST_TIMEOUT_MS);
+        expectAlarmCancelled(inOrder, clearAlarm);
+        expectNat64PrefixUpdate(inOrder, null);
+
+        // Check that even if the alarm was already in the message queue while it was cancelled, it
+        // is safely ignored.
+        mIpc.getHandler().post(() -> clearAlarm.onAlarm());
+        HandlerUtilsKt.waitForIdle(mIpc.getHandler(), TEST_TIMEOUT_MS);
+    }
+
+    private void addIpAddressAndWaitForIt(final String iface) throws Exception {
+        final CountDownLatch latch = new CountDownLatch(1);
+
+        final String addr1 = "192.0.2.99";
+        final String addr2 = "192.0.2.3";
+        final int prefixLength = 26;
+
+        // Add two IPv4 addresses to the specified interface, and proceed when the NetworkObserver
+        // has seen the second one. This ensures that every other NetworkObserver registered with
+        // mNetworkObserverRegistry - in particular, IpClient's - has seen the addition of the first
+        // address.
+        final LinkAddress trigger = new LinkAddress(addr2 + "/" + prefixLength);
+        NetworkObserver observer = new NetworkObserver() {
+            @Override
+            public void onInterfaceAddressUpdated(LinkAddress address, String ifName) {
+                if (ifName.equals(iface) && address.isSameAddressAs(trigger)) {
+                    latch.countDown();
+                }
+            }
+        };
+
+        mNetworkObserverRegistry.registerObserverForNonblockingCallback(observer);
+        try {
+            mNetd.interfaceAddAddress(iface, addr1, prefixLength);
+            mNetd.interfaceAddAddress(iface, addr2, prefixLength);
+            assertTrue("Trigger IP address " + addr2 + " not seen after " + TEST_TIMEOUT_MS + "ms",
+                    latch.await(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS));
+        } finally {
+            mNetworkObserverRegistry.unregisterObserver(observer);
+        }
+
+        // Wait for IpClient to process the addition of the address.
+        HandlerUtilsKt.waitForIdle(mIpc.getHandler(), TEST_TIMEOUT_MS);
     }
 
     @Test
@@ -1338,6 +1673,7 @@ public class IpClientIntegrationTest {
         performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
                 true /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
                 TEST_DEFAULT_MTU, false /* isDhcpIpConflictDetectEnabled */);
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
 
         // Stop IpClient and expect a final LinkProperties callback with an empty LP.
@@ -1350,14 +1686,29 @@ public class IpClientIntegrationTest {
 
         // Pretend that something else (e.g., Tethering) used the interface and left an IP address
         // configured on it. When IpClient starts, it must clear this address before proceeding.
-        // TODO: test IPv6 instead, since the DHCP client will remove this address by replacing it
-        // with the new address.
-        mNetd.interfaceAddAddress(mIfaceName, "192.0.2.99", 26);
+        // The address must be noticed before startProvisioning is called, or IpClient will
+        // immediately declare provisioning success due to the presence of an IPv4 address.
+        // The address must be IPv4 because IpClient clears IPv6 addresses on startup.
+        //
+        // TODO: once IpClient gets IP addresses directly from netlink instead of from netd, it
+        // may be sufficient to call waitForIdle to see if IpClient has seen the address.
+        addIpAddressAndWaitForIt(mIfaceName);
 
-        // start IpClient again and should enter Clearing State and wait for the message from kernel
-        performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
-                true /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
-                TEST_DEFAULT_MTU, false /* isDhcpIpConflictDetectEnabled */);
+        ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
+                .withoutIpReachabilityMonitor()
+                .build();
+        mIpc.startProvisioning(config);
+
+        sendBasicRouterAdvertisement(true /*waitForRs*/);
+
+        // Check that the IPv4 addresses configured earlier are not in LinkProperties...
+        ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningSuccess(captor.capture());
+        assertFalse(captor.getValue().hasIpv4Address());
+
+        // ... or configured on the interface.
+        InterfaceConfigurationParcel cfg = mNetd.interfaceGetCfg(mIfaceName);
+        assertEquals("0.0.0.0", cfg.ipv4Addr);
     }
 
     @Test
@@ -1448,6 +1799,28 @@ public class IpClientIntegrationTest {
     }
 
     @Test
+    public void testDhcpClientPreconnection_WithoutLayer2InfoWhenStartingProv() throws Exception {
+        // For FILS connection, current bssid (also l2key and cluster) is still null when
+        // starting provisioning since the L2 link hasn't been established yet. Ensure that
+        // IpClient won't crash even if initializing an Layer2Info class with null members.
+        ProvisioningConfiguration.Builder prov = new ProvisioningConfiguration.Builder()
+                .withoutIpReachabilityMonitor()
+                .withoutIPv6()
+                .withPreconnection()
+                .withLayer2Information(new Layer2Information(null /* l2key */, null /* cluster */,
+                        null /* bssid */));
+
+        mIpc.startProvisioning(prov.build());
+        assertDiscoverPacketOnPreconnectionStart();
+        verify(mCb).setNeighborDiscoveryOffload(true);
+
+        // Force IpClient transition to RunningState from PreconnectionState.
+        mIpc.notifyPreconnectionComplete(false /* success */);
+        HandlerUtilsKt.waitForIdle(mDependencies.mDhcpClient.getHandler(), TEST_TIMEOUT_MS);
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).setFallbackMulticastFilter(false);
+    }
+
+    @Test
     public void testDhcpDecline_conflictByArpReply() throws Exception {
         doIpAddressConflictDetectionTest(true /* causeIpAddressConflict */,
                 false /* shouldReplyRapidCommitAck */, true /* isDhcpIpConflictDetectEnabled */,
@@ -1513,6 +1886,7 @@ public class IpClientIntegrationTest {
                 true /* isHostnameConfigurationEnabled */, TEST_HOST_NAME /* hostname */,
                 null /* captivePortalApiUrl */, null /* displayName */, null /* scanResultInfo */);
         assertEquals(2, sentPackets.size());
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertHostname(true, TEST_HOST_NAME, TEST_HOST_NAME_TRANSLITERATION, sentPackets);
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
@@ -1527,6 +1901,7 @@ public class IpClientIntegrationTest {
                 false /* isHostnameConfigurationEnabled */, TEST_HOST_NAME,
                 null /* captivePortalApiUrl */, null /* displayName */, null /* scanResultInfo */);
         assertEquals(2, sentPackets.size());
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertHostname(false, TEST_HOST_NAME, TEST_HOST_NAME_TRANSLITERATION, sentPackets);
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
@@ -1541,6 +1916,7 @@ public class IpClientIntegrationTest {
                 true /* isHostnameConfigurationEnabled */, null /* hostname */,
                 null /* captivePortalApiUrl */, null /* displayName */, null /* scanResultInfo */);
         assertEquals(2, sentPackets.size());
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertHostname(true, null /* hostname */, null /* hostnameAfterTransliteration */,
                 sentPackets);
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
@@ -1561,16 +1937,21 @@ public class IpClientIntegrationTest {
                 (short) TEST_DEFAULT_MTU, serverSentUrl));
         final int testMtu = 1345;
         handleDhcpPackets(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
-                false /* isDhcpRapidCommitEnabled */, testMtu,
-                false /* isDhcpIpConflictDetectEnabled */, serverSentUrl);
+                false /* shouldReplyRapidCommitAck */, testMtu, serverSentUrl);
 
         final Uri expectedUrl = featureEnabled && serverSendsOption
                 ? Uri.parse(TEST_CAPTIVE_PORTAL_URL) : null;
-        // Wait for LinkProperties containing DHCP-obtained info, such as MTU, and ensure that the
-        // URL is set as expected
-        verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(argThat(lp ->
-                lp.getMtu() == testMtu
-                        && Objects.equals(expectedUrl, lp.getCaptivePortalApiUrl())));
+        // Wait for LinkProperties containing DHCP-obtained info, such as MTU
+        final ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(
+                argThat(lp -> lp.getMtu() == testMtu));
+
+        // Ensure that the URL was set as expected in the callbacks.
+        // Can't verify the URL up to Q as there is no such attribute in LinkProperties.
+        if (!ShimUtils.isAtLeastR()) return;
+        verify(mCb).onLinkPropertiesChange(captor.capture());
+        assertTrue(captor.getAllValues().stream().anyMatch(
+                lp -> Objects.equals(expectedUrl, lp.getCaptivePortalApiUrl())));
     }
 
     @Test
@@ -1625,6 +2006,7 @@ public class IpClientIntegrationTest {
                 false /* isHostnameConfigurationEnabled */, null /* hostname */,
                 null /* captivePortalApiUrl */, displayName, info /* scanResultInfo */);
         assertEquals(2, sentPackets.size());
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
 
         ArgumentCaptor<DhcpResultsParcelable> captor =
                 ArgumentCaptor.forClass(DhcpResultsParcelable.class);
@@ -1708,6 +2090,9 @@ public class IpClientIntegrationTest {
         doAnswer(invocation -> {
             // we don't rely on the Init-Reboot state to renew previous cached IP lease.
             // Just return null and force state machine enter INIT state.
+            final String l2Key = invocation.getArgument(0);
+            ((OnNetworkAttributesRetrievedListener) invocation.getArgument(1))
+                    .onNetworkAttributesRetrieved(new Status(SUCCESS), l2Key, null);
             return null;
         }).when(mIpMemoryStore).retrieveNetworkAttributes(eq(TEST_L2KEY), any());
 
@@ -1716,13 +2101,14 @@ public class IpClientIntegrationTest {
                 TEST_DEFAULT_MTU, false /* isDhcpIpConflictDetectEnabled */,
                 true /* isHostnameConfigurationEnabled */, null /* hostname */,
                 null /* captivePortalApiUrl */, displayName, scanResultInfo);
+        verifyIPv4OnlyProvisioningSuccess(Collections.singletonList(CLIENT_ADDR));
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
 
         // simulate the roaming by updating bssid.
         final Layer2InformationParcelable roamingInfo = new Layer2InformationParcelable();
         roamingInfo.bssid = MacAddress.fromString(TEST_DHCP_ROAM_BSSID);
         roamingInfo.l2Key = TEST_DHCP_ROAM_L2KEY;
-        roamingInfo.groupHint = TEST_DHCP_ROAM_GROUPHINT;
+        roamingInfo.cluster = TEST_DHCP_ROAM_CLUSTER;
         mIpc.updateLayer2Information(roamingInfo);
 
         currentTime = System.currentTimeMillis();
@@ -1789,5 +2175,74 @@ public class IpClientIntegrationTest {
     public void testDhcpRoaming_mismatchedLeasedIpAddress() throws Exception {
         doDhcpRoamingTest(true /* hasMismatchedIpAddress */, "\"0001docomo\"" /* display name */,
                 TEST_DHCP_ROAM_SSID, TEST_DEFAULT_BSSID, true /* expectRoaming */);
+    }
+
+    private void doDualStackProvisioning() throws Exception {
+        when(mCm.shouldAvoidBadWifi()).thenReturn(true);
+
+        final ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
+                .withoutIpReachabilityMonitor()
+                .build();
+        // Accelerate DHCP handshake to shorten test duration, not strictly necessary.
+        mDependencies.setDhcpRapidCommitEnabled(true);
+        mIpc.startProvisioning(config);
+
+        final InOrder inOrder = inOrder(mCb);
+        final CompletableFuture<LinkProperties> lpFuture = new CompletableFuture<>();
+        final String dnsServer = "2001:4860:4860::64";
+        final ByteBuffer pio = buildPioOption(3600, 1800, "2001:db8:1::/64");
+        final ByteBuffer rdnss = buildRdnssOption(3600, dnsServer);
+        final ByteBuffer ra = buildRaPacket(pio, rdnss);
+
+        doIpv6OnlyProvisioning(inOrder, ra);
+
+        // Start IPv4 provisioning and wait until entire provisioning completes.
+        handleDhcpPackets(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
+                true /* shouldReplyRapidCommitAck */, TEST_DEFAULT_MTU, null /* serverSentUrl */);
+        verify(mCb, timeout(TEST_TIMEOUT_MS).atLeastOnce()).onLinkPropertiesChange(argThat(x -> {
+            if (!x.isIpv4Provisioned() || !x.isIpv6Provisioned()) return false;
+            lpFuture.complete(x);
+            return true;
+        }));
+
+        final LinkProperties lp = lpFuture.get(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        assertNotNull(lp);
+        assertTrue(lp.getDnsServers().contains(InetAddress.getByName(dnsServer)));
+        assertTrue(lp.getDnsServers().contains(SERVER_ADDR));
+
+        reset(mCb);
+    }
+
+    @Test
+    public void testIgnoreIpv6ProvisioningLoss() throws Exception {
+        doDualStackProvisioning();
+
+        final CompletableFuture<LinkProperties> lpFuture = new CompletableFuture<>();
+
+        // Send RA with 0-lifetime and wait until all IPv6-related default route and DNS servers
+        // have been removed, then verify if there is IPv4-only info left in the LinkProperties.
+        sendRouterAdvertisementWithZeroLifetime();
+        verify(mCb, timeout(TEST_TIMEOUT_MS).atLeastOnce()).onLinkPropertiesChange(
+                argThat(x -> {
+                    final boolean isOnlyIPv4Provisioned = (x.getLinkAddresses().size() == 1
+                            && x.getDnsServers().size() == 1
+                            && x.getAddresses().get(0) instanceof Inet4Address
+                            && x.getDnsServers().get(0) instanceof Inet4Address);
+
+                    if (!isOnlyIPv4Provisioned) return false;
+                    lpFuture.complete(x);
+                    return true;
+                }));
+        final LinkProperties lp = lpFuture.get(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        assertNotNull(lp);
+        assertEquals(lp.getAddresses().get(0), CLIENT_ADDR);
+        assertEquals(lp.getDnsServers().get(0), SERVER_ADDR);
+    }
+
+    @Test
+    public void testDualStackProvisioning() throws Exception {
+        doDualStackProvisioning();
+
+        verify(mCb, never()).onProvisioningFailure(any());
     }
 }

@@ -18,6 +18,7 @@
 package android.net;
 
 import android.net.InitialConfigurationParcelable;
+import android.net.Layer2InformationParcelable;
 import android.net.Network;
 import android.net.ScanResultInfoParcelable;
 import android.net.StaticIpConfiguration;
@@ -37,5 +38,6 @@ parcelable ProvisioningConfigurationParcelable {
     Network network;
     String displayName;
     boolean enablePreconnection;
-    ScanResultInfoParcelable scanResultInfo;
+    @nullable ScanResultInfoParcelable scanResultInfo;
+    @nullable Layer2InformationParcelable layer2Info;
 }

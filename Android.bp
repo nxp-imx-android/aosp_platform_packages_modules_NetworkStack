@@ -48,9 +48,10 @@ java_defaults {
 
 java_defaults {
     name: "NetworkStackReleaseApiLevel",
-    sdk_version: "system_29",
+    // TODO: use system_30 once a prebuilt SDK is available for R
+    sdk_version: "system_current",
     min_sdk_version: "29",
-    target_sdk_version: "29",
+    target_sdk_version: "30",
 }
 
 // Filegroups for the API shims
@@ -60,6 +61,7 @@ filegroup {
         "apishim/common/**/*.java",
         "apishim/29/**/*.java",
         "apishim/30/**/*.java",
+        "apishim/31/**/*.java",
         ":networkstack-module-utils-srcs",
     ],
 }
@@ -71,6 +73,7 @@ filegroup {
     srcs: [
         "apishim/common/**/*.java",
         "apishim/29/**/*.java",
+        "apishim/30/**/*.java",
         ":networkstack-module-utils-srcs",
     ],
 }
@@ -85,7 +88,7 @@ java_defaults {
     libs: ["unsupportedappusage"],
     static_libs: [
         "androidx.annotation_annotation",
-        "netd_aidl_interface-V3-java",
+        "netd_aidl_interface-unstable-java",
         "netlink-client",
         "networkstack-client",
         "datastallprotosnano",
@@ -203,6 +206,7 @@ android_app {
     manifest: "AndroidManifest.xml",
     // The permission configuration *must* be included to ensure security of the device
     required: ["NetworkPermissionConfig"],
+    updatable: true,
 }
 
 // Android library to derive test APKs for integration tests
@@ -211,7 +215,10 @@ android_library {
     defaults: ["NetworkStackAppDefaults", "NetworkStackReleaseApiLevel"],
     static_libs: ["NetworkStackApiStableLib"],
     manifest: "AndroidManifestBase.xml",
-    visibility: ["//frameworks/base/tests/net/integration"],
+    visibility: [
+        "//frameworks/base/tests/net/integration",
+        "//cts/tests/tests/net",
+    ],
 }
 
 cc_library_shared {
@@ -219,7 +226,8 @@ cc_library_shared {
     srcs: [
         "jni/network_stack_utils_jni.cpp"
     ],
-    sdk_version: "current",
+    sdk_version: "29",
+    min_sdk_version: "29",
     shared_libs: [
         "liblog",
         "libnativehelper_compat_libc++",

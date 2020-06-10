@@ -24,6 +24,11 @@ aidl_interface {
         "src/android/net/ipmemorystore/**/*.aidl",
     ],
     backend: {
+        java: {
+            apex_available: [
+                "//apex_available:platform",
+            ],
+        },
         ndk: {
             enabled: false,
         },
@@ -37,9 +42,11 @@ aidl_interface {
         "3",
         "4",
         "5",
+        "6",
+        "7",
     ],
     visibility: [
-        "//system/tools/aidl/build"
+        "//system/tools/aidl/build",
     ],
 }
 
@@ -52,6 +59,7 @@ aidl_interface {
         "frameworks/base/wifi/aidl-export", // For wifi parcelables.
     ],
     srcs: [
+        "src/android/net/DataStallReportParcelable.aidl",
         "src/android/net/DhcpResultsParcelable.aidl",
         "src/android/net/INetworkMonitor.aidl",
         "src/android/net/INetworkMonitorCallbacks.aidl",
@@ -62,6 +70,7 @@ aidl_interface {
         "src/android/net/Layer2InformationParcelable.aidl",
         "src/android/net/Layer2PacketParcelable.aidl",
         "src/android/net/NattKeepalivePacketDataParcelable.aidl",
+        "src/android/net/NetworkTestResultParcelable.aidl",
         "src/android/net/PrivateDnsConfigParcel.aidl",
         "src/android/net/ProvisioningConfigurationParcelable.aidl",
         "src/android/net/ScanResultInfoParcelable.aidl",
@@ -75,6 +84,12 @@ aidl_interface {
         "src/android/net/ip/IIpClientCallbacks.aidl",
     ],
     backend: {
+        java: {
+            apex_available: [
+                "//apex_available:platform",
+                "com.android.bluetooth.updatable",
+            ],
+        },
         ndk: {
             enabled: false,
         },
@@ -89,11 +104,13 @@ aidl_interface {
         "3",
         "4",
         "5",
+        "6",
+        "7",
     ],
     // TODO: have tethering depend on networkstack-client and set visibility to private
     visibility: [
         "//system/tools/aidl/build",
-        "//frameworks/base/packages/Tethering"
+        "//frameworks/base/packages/Tethering",
     ],
 }
 
@@ -107,13 +124,13 @@ java_library {
         "src/android/net/networkstack/**/*.java",
     ],
     static_libs: [
-        "ipmemorystore-aidl-interfaces-V5-java",
-        "networkstack-aidl-interfaces-unstable-java",
+        "ipmemorystore-aidl-interfaces-java",
+        "networkstack-aidl-interfaces-java",
     ],
     visibility: [
         "//frameworks/base/packages/Tethering",
         "//frameworks/base/services/net",
         "//frameworks/opt/net/wifi/service",
         "//packages/modules/NetworkStack",
-    ]
+    ],
 }

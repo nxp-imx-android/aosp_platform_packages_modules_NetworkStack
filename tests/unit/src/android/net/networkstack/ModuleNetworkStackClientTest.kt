@@ -29,15 +29,16 @@ import android.os.Build
 import android.os.IBinder
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.SmallTest
-import com.android.networkstack.apishim.ShimUtils
+import com.android.dx.mockito.inline.extended.ExtendedMockito.doReturn
+import com.android.dx.mockito.inline.extended.ExtendedMockito.mockitoSession
+import com.android.testutils.DevSdkIgnoreRule
 import org.junit.After
-import org.junit.Assume.assumeTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mock
-import org.mockito.Mockito.doReturn
 import org.mockito.Mockito.never
 import org.mockito.Mockito.timeout
 import org.mockito.Mockito.verify
@@ -49,6 +50,10 @@ class ModuleNetworkStackClientTest {
     private val TEST_IFNAME = "testiface"
     private val TEST_NETWORK = Network(43)
     private val TEST_TIMEOUT_MS = 500L
+
+    // ModuleNetworkStackClient is only available after Q
+    @Rule @JvmField
+    val mIgnoreRule = DevSdkIgnoreRule(ignoreClassUpTo = Build.VERSION_CODES.Q)
 
     @Mock
     private lateinit var mContext: Context
@@ -67,8 +72,6 @@ class ModuleNetworkStackClientTest {
 
     @Before
     fun setUp() {
-        // ModuleNetworkStackClient is only available after Q
-        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q))
         MockitoAnnotations.initMocks(this)
         doReturn(mConnector).`when`(mConnectorBinder).queryLocalInterface(
                 INetworkStackConnector::class.qualifiedName!!)
@@ -89,11 +92,21 @@ class ModuleNetworkStackClientTest {
 
     @Test
     fun testIpClientServiceAvailableAfterPolling() {
-        ModuleNetworkStackClient.getInstance(mContext).makeIpClient(TEST_IFNAME, mIpClientCb)
+        // Force NetworkStack.getService() to return null: this cannot be done with
+        // setServiceForTest, as passing null just restores default behavior.
+        val session = mockitoSession().spyStatic(NetworkStack::class.java).startMocking()
+        try {
+            doReturn(null).`when` { NetworkStack.getService() }
+            ModuleNetworkStackClient.getInstance(mContext).makeIpClient(TEST_IFNAME, mIpClientCb)
 
-        Thread.sleep(TEST_TIMEOUT_MS)
-        verify(mConnector, never()).makeIpClient(any(), any())
-        NetworkStack.setServiceForTest(mConnectorBinder)
+            Thread.sleep(TEST_TIMEOUT_MS)
+            verify(mConnector, never()).makeIpClient(any(), any())
+            NetworkStack.setServiceForTest(mConnectorBinder)
+        } finally {
+            // Restore behavior of NetworkStack to return what was set in setServiceForTest
+            session.finishMocking()
+        }
+
         // Use a longer timeout as polling can cause larger delays
         verify(mConnector, timeout(TEST_TIMEOUT_MS * 4)).makeIpClient(TEST_IFNAME, mIpClientCb)
     }

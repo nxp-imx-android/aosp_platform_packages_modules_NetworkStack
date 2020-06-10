@@ -16,6 +16,7 @@
 
 package android.net.shared;
 
+import android.annotation.Nullable;
 import android.net.Layer2InformationParcelable;
 import android.net.MacAddress;
 
@@ -23,16 +24,20 @@ import java.util.Objects;
 
 /** @hide */
 public class Layer2Information {
-    private final String mL2Key;
-    private final String mGroupHint;
-    private final MacAddress mBssid;
+    @Nullable
+    public final String mL2Key;
+    @Nullable
+    public final String mCluster;
+    @Nullable
+    public final MacAddress mBssid;
 
     /**
      * Create a Layer2Information with the specified configuration.
      */
-    public Layer2Information(String l2Key, String groupHint, MacAddress bssid) {
+    public Layer2Information(@Nullable final String l2Key, @Nullable final String cluster,
+            @Nullable final MacAddress bssid) {
         mL2Key = l2Key;
-        mGroupHint = groupHint;
+        mCluster = cluster;
         mBssid = bssid;
     }
 
@@ -40,8 +45,8 @@ public class Layer2Information {
     public String toString() {
         StringBuffer str = new StringBuffer();
         str.append("L2Key: ").append(mL2Key);
-        str.append(", GroupHint: ").append(mGroupHint);
-        str.append(", bssid: ").append(mBssid.toString());
+        str.append(", Cluster: ").append(mCluster);
+        str.append(", bssid: ").append(mBssid);
         return str.toString();
     }
 
@@ -51,7 +56,7 @@ public class Layer2Information {
     public Layer2InformationParcelable toStableParcelable() {
         final Layer2InformationParcelable p = new Layer2InformationParcelable();
         p.l2Key = mL2Key;
-        p.groupHint = mGroupHint;
+        p.cluster = mCluster;
         p.bssid = mBssid;
         return p;
     }
@@ -60,9 +65,9 @@ public class Layer2Information {
      * Create an instance of {@link Layer2Information} based on the contents of the specified
      * {@link Layer2InformationParcelable}.
      */
-    public Layer2Information fromStableParcelable(Layer2InformationParcelable p) {
+    public static Layer2Information fromStableParcelable(Layer2InformationParcelable p) {
         if (p == null) return null;
-        return new Layer2Information(p.l2Key, p.groupHint, p.bssid);
+        return new Layer2Information(p.l2Key, p.cluster, p.bssid);
     }
 
     @Override
@@ -70,12 +75,12 @@ public class Layer2Information {
         if (!(obj instanceof Layer2Information)) return false;
         final Layer2Information other = (Layer2Information) obj;
         return Objects.equals(mL2Key, other.mL2Key)
-                && Objects.equals(mGroupHint, other.mGroupHint)
+                && Objects.equals(mCluster, other.mCluster)
                 && Objects.equals(mBssid, other.mBssid);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(mL2Key, mGroupHint, mBssid);
+        return Objects.hash(mL2Key, mCluster, mBssid);
     }
 }

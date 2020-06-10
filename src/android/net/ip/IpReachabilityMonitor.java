@@ -187,7 +187,7 @@ public class IpReachabilityMonitor {
     private final Dependencies mDependencies;
     private final boolean mUsingMultinetworkPolicyTracker;
     private final ConnectivityManager mCm;
-    private final IpConnectivityLog mMetricsLog = new IpConnectivityLog();
+    private final IpConnectivityLog mMetricsLog;
     private final Context mContext;
     private final INetd mNetd;
     private LinkProperties mLinkProperties = new LinkProperties();
@@ -201,13 +201,13 @@ public class IpReachabilityMonitor {
             Context context, InterfaceParams ifParams, Handler h, SharedLog log, Callback callback,
             boolean usingMultinetworkPolicyTracker, final INetd netd) {
         this(context, ifParams, h, log, callback, usingMultinetworkPolicyTracker,
-                Dependencies.makeDefault(context, ifParams.name), netd);
+                Dependencies.makeDefault(context, ifParams.name), new IpConnectivityLog(), netd);
     }
 
     @VisibleForTesting
     IpReachabilityMonitor(Context context, InterfaceParams ifParams, Handler h, SharedLog log,
             Callback callback, boolean usingMultinetworkPolicyTracker, Dependencies dependencies,
-            final INetd netd) {
+            final IpConnectivityLog metricsLog, final INetd netd) {
         if (ifParams == null) throw new IllegalArgumentException("null InterfaceParams");
 
         mContext = context;
@@ -217,6 +217,7 @@ public class IpReachabilityMonitor {
         mUsingMultinetworkPolicyTracker = usingMultinetworkPolicyTracker;
         mCm = context.getSystemService(ConnectivityManager.class);
         mDependencies = dependencies;
+        mMetricsLog = metricsLog;
         mNetd = netd;
         Preconditions.checkNotNull(mNetd);
         Preconditions.checkArgument(!TextUtils.isEmpty(mInterfaceParams.name));
@@ -340,7 +341,14 @@ public class IpReachabilityMonitor {
             // TODO: Consider using NeighborEvent#isValid() here; it's more
             // strict but may interact badly if other entries are somehow in
             // NUD_INCOMPLETE (say, during network attach).
-            if (entry.getValue().nudState != StructNdMsg.NUD_FAILED) continue;
+            final NeighborEvent val = entry.getValue();
+
+            // Find all the neighbors that have gone into FAILED state.
+            // Ignore entries for which we have never received an event. If there are neighbors
+            // that never respond to ARP/ND, the kernel will send several FAILED events, then
+            // an INCOMPLETE event, and then more FAILED events. The INCOMPLETE event will
+            // populate the map and the subsequent FAILED event will be processed.
+            if (val == null || val.nudState != StructNdMsg.NUD_FAILED) continue;
 
             ip = entry.getKey();
             for (RouteInfo route : mLinkProperties.getRoutes()) {
@@ -377,10 +385,12 @@ public class IpReachabilityMonitor {
                 Log.d(TAG, "neighbour IPv4(v6): " + entry.getKey() + " neighbour state: "
                         + StructNdMsg.stringForNudState(entry.getValue().nudState));
             }
-            if (entry.getValue().nudState != StructNdMsg.NUD_REACHABLE) return;
+            final NeighborEvent val = entry.getValue();
+            // If an entry is null, consider that probing for that neighbour has completed.
+            if (val == null || val.nudState != StructNdMsg.NUD_REACHABLE) return;
         }
 
-        // All neighbours in the watchlist are in REACHABLE state and connection is stable,
+        // Probing for all neighbours in the watchlist is complete and the connection is stable,
         // restore NUD probe parameters to steadystate value. In the case where neighbours
         // are responsive, this code will run before the wakelock expires.
         setNeighbourParametersForSteadyState();

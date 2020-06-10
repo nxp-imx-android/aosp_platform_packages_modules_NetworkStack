@@ -18,18 +18,19 @@ package android.net.captiveportal;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
-import com.android.networkstack.apishim.CaptivePortalDataShim;
+import com.android.networkstack.apishim.common.CaptivePortalDataShim;
 
 /**
  * Captive portal probe detection result including capport API detection result.
  * @hide
  */
 public class CapportApiProbeResult extends CaptivePortalProbeResult {
-    @NonNull
+    // CaptivePortalData may be null if the capport API does not send any valid reply.
+    @Nullable
     private final CaptivePortalDataShim mCapportData;
 
     public CapportApiProbeResult(@NonNull CaptivePortalProbeResult result,
-            @NonNull CaptivePortalDataShim capportData) {
+            @Nullable CaptivePortalDataShim capportData) {
         this(result.mHttpResponseCode, result.redirectUrl, result.detectUrl, capportData,
                 result.probeType);
     }

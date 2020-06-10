@@ -20,6 +20,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.NotificationManager.IMPORTANCE_DEFAULT
+import android.app.NotificationManager.IMPORTANCE_NONE
 import android.app.PendingIntent
 import android.app.PendingIntent.FLAG_UPDATE_CURRENT
 import android.content.Context
@@ -80,6 +81,8 @@ class NetworkStackNotifierTest {
     @Mock
     private lateinit var mNm: NotificationManager
     @Mock
+    private lateinit var mNotificationChannelsNm: NotificationManager
+    @Mock
     private lateinit var mCm: ConnectivityManager
     @Mock
     private lateinit var mResources: Resources
@@ -98,6 +101,16 @@ class NetworkStackNotifierTest {
     private lateinit var mAllNetworksCb: NetworkCallback
     private lateinit var mDefaultNetworkCb: NetworkCallback
 
+    // Lazy-init as CaptivePortalData does not exist on Q.
+    private val mTestCapportLp by lazy {
+        LinkProperties().apply {
+            captivePortalData = CaptivePortalData.Builder()
+                    .setCaptive(false)
+                    .setVenueInfoUrl(Uri.parse(TEST_VENUE_INFO_URL))
+                    .build()
+        }
+    }
+
     private val TEST_NETWORK = Network(42)
     private val TEST_NETWORK_TAG = TEST_NETWORK.networkHandle.toString()
     private val TEST_SSID = "TestSsid"
@@ -111,12 +124,6 @@ class NetworkStackNotifierTest {
 
     private val TEST_VENUE_INFO_URL = "https://testvenue.example.com/info"
     private val EMPTY_CAPPORT_LP = LinkProperties()
-    private val TEST_CAPPORT_LP = LinkProperties().apply {
-        captivePortalData = CaptivePortalData.Builder()
-                .setCaptive(false)
-                .setVenueInfoUrl(Uri.parse(TEST_VENUE_INFO_URL))
-                .build()
-    }
 
     @Before
     fun setUp() {
@@ -137,10 +144,12 @@ class NetworkStackNotifierTest {
                 realContext.packageName, 0, UserHandle.ALL)
 
         mAllUserContext.mockService(Context.NOTIFICATION_SERVICE, NotificationManager::class, mNm)
+        mContext.mockService(Context.NOTIFICATION_SERVICE, NotificationManager::class,
+                mNotificationChannelsNm)
         mContext.mockService(Context.CONNECTIVITY_SERVICE, ConnectivityManager::class, mCm)
 
         doReturn(NotificationChannel(CHANNEL_VENUE_INFO, "TestChannel", IMPORTANCE_DEFAULT))
-                .`when`(mNm).getNotificationChannel(CHANNEL_VENUE_INFO)
+                .`when`(mNotificationChannelsNm).getNotificationChannel(CHANNEL_VENUE_INFO)
 
         doReturn(mPendingIntent).`when`(mDependencies).getActivityPendingIntent(
                 any(), any(), anyInt())
@@ -226,7 +235,7 @@ class NetworkStackNotifierTest {
         // Venue info (CaptivePortalData) is not available for API <= Q
         assumeTrue(NetworkInformationShimImpl.useApiAboveQ())
         mNotifier.notifyCaptivePortalValidationPending(TEST_NETWORK)
-        onLinkPropertiesChanged(TEST_CAPPORT_LP)
+        onLinkPropertiesChanged(mTestCapportLp)
         onDefaultNetworkAvailable(TEST_NETWORK)
         val capabilities = NetworkCapabilities(VALIDATED_CAPABILITIES).setSSID(TEST_SSID)
         onCapabilitiesChanged(capabilities)
@@ -243,9 +252,10 @@ class NetworkStackNotifierTest {
     fun testConnectedVenueInfoNotification_VenueInfoDisabled() {
         // Venue info (CaptivePortalData) is not available for API <= Q
         assumeTrue(NetworkInformationShimImpl.useApiAboveQ())
-        doReturn(null).`when`(mNm).getNotificationChannel(CHANNEL_VENUE_INFO)
+        val channel = NotificationChannel(CHANNEL_VENUE_INFO, "test channel", IMPORTANCE_NONE)
+        doReturn(channel).`when`(mNotificationChannelsNm).getNotificationChannel(CHANNEL_VENUE_INFO)
         mNotifier.notifyCaptivePortalValidationPending(TEST_NETWORK)
-        onLinkPropertiesChanged(TEST_CAPPORT_LP)
+        onLinkPropertiesChanged(mTestCapportLp)
         onDefaultNetworkAvailable(TEST_NETWORK)
         val capabilities = NetworkCapabilities(VALIDATED_CAPABILITIES).setSSID(TEST_SSID)
         onCapabilitiesChanged(capabilities)
@@ -261,7 +271,7 @@ class NetworkStackNotifierTest {
     fun testVenueInfoNotification() {
         // Venue info (CaptivePortalData) is not available for API <= Q
         assumeTrue(NetworkInformationShimImpl.useApiAboveQ())
-        onLinkPropertiesChanged(TEST_CAPPORT_LP)
+        onLinkPropertiesChanged(mTestCapportLp)
         onDefaultNetworkAvailable(TEST_NETWORK)
         val capabilities = NetworkCapabilities(VALIDATED_CAPABILITIES).setSSID(TEST_SSID)
         onCapabilitiesChanged(capabilities)
@@ -279,7 +289,7 @@ class NetworkStackNotifierTest {
         // Venue info (CaptivePortalData) is not available for API <= Q
         assumeTrue(NetworkInformationShimImpl.useApiAboveQ())
         doReturn(null).`when`(mNm).getNotificationChannel(CHANNEL_VENUE_INFO)
-        onLinkPropertiesChanged(TEST_CAPPORT_LP)
+        onLinkPropertiesChanged(mTestCapportLp)
         onDefaultNetworkAvailable(TEST_NETWORK)
         onCapabilitiesChanged(VALIDATED_CAPABILITIES)
         mLooper.processAllMessages()
@@ -291,7 +301,7 @@ class NetworkStackNotifierTest {
     fun testNonDefaultVenueInfoNotification() {
         // Venue info (CaptivePortalData) is not available for API <= Q
         assumeTrue(NetworkInformationShimImpl.useApiAboveQ())
-        onLinkPropertiesChanged(TEST_CAPPORT_LP)
+        onLinkPropertiesChanged(mTestCapportLp)
         onCapabilitiesChanged(VALIDATED_CAPABILITIES)
         mLooper.processAllMessages()
 
@@ -313,7 +323,7 @@ class NetworkStackNotifierTest {
     fun testUnvalidatedNetworkVenueInfoNotification() {
         // Venue info (CaptivePortalData) is not available for API <= Q
         assumeTrue(NetworkInformationShimImpl.useApiAboveQ())
-        onLinkPropertiesChanged(TEST_CAPPORT_LP)
+        onLinkPropertiesChanged(mTestCapportLp)
         onCapabilitiesChanged(EMPTY_CAPABILITIES)
         mLooper.processAllMessages()
 
