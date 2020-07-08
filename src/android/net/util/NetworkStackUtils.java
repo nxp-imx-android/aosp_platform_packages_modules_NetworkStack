@@ -18,10 +18,12 @@ package android.net.util;
 
 import android.content.Context;
 import android.content.pm.PackageManager.NameNotFoundException;
+import android.content.res.Resources;
 import android.provider.DeviceConfig;
 import android.util.Log;
 import android.util.SparseArray;
 
+import androidx.annotation.BoolRes;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
@@ -435,5 +437,36 @@ public class NetworkStackUtils {
     public static boolean isIPv6ULA(@Nullable InetAddress addr) {
         return addr instanceof Inet6Address
                 && ((addr.getAddress()[0] & 0xfe) == 0xfc);
+    }
+
+    /**
+     * Returns the {@code int} nearest in value to {@code value}.
+     *
+     * @param value any {@code long} value
+     * @return the same value cast to {@code int} if it is in the range of the {@code int}
+     * type, {@link Integer#MAX_VALUE} if it is too large, or {@link Integer#MIN_VALUE} if
+     * it is too small
+     */
+    public static int saturatedCast(long value) {
+        if (value > Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        if (value < Integer.MIN_VALUE) {
+            return Integer.MIN_VALUE;
+        }
+        return (int) value;
+    }
+
+    /**
+     * Gets boolean config from resources.
+     */
+    public static boolean getResBooleanConfig(@NonNull final Context context,
+            @BoolRes int configResource, final boolean defaultValue) {
+        final Resources res = context.getResources();
+        try {
+            return res.getBoolean(configResource);
+        } catch (Resources.NotFoundException e) {
+            return defaultValue;
+        }
     }
 }

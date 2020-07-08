@@ -80,6 +80,7 @@ import android.os.Message;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.stats.connectivity.DhcpFeature;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.util.EventLog;
@@ -101,6 +102,7 @@ import com.android.networkstack.apishim.CaptivePortalDataShimImpl;
 import com.android.networkstack.apishim.SocketUtilsShimImpl;
 import com.android.networkstack.apishim.common.ShimUtils;
 import com.android.networkstack.arp.ArpPacket;
+import com.android.networkstack.metrics.IpProvisioningMetrics;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -154,6 +156,7 @@ public class DhcpClient extends StateMachine {
     private static final int FIRST_TIMEOUT_MS         =   1 * SECONDS;
     private static final int MAX_TIMEOUT_MS           = 512 * SECONDS;
     private static final int IPMEMORYSTORE_TIMEOUT_MS =   1 * SECONDS;
+    private static final int DHCP_INITREBOOT_TIMEOUT_MS = 5 * SECONDS;
 
     // The waiting time to restart the DHCP configuration process after broadcasting a
     // DHCPDECLINE message, (RFC2131 3.1.5 describes client SHOULD wait a minimum of 10
@@ -304,6 +307,8 @@ public class DhcpClient extends StateMachine {
     private final Context mContext;
     private final Random mRandom;
     private final IpConnectivityLog mMetricsLog = new IpConnectivityLog();
+    @NonNull
+    private final IpProvisioningMetrics mMetrics;
 
     // We use a UDP socket to send, so the kernel handles ARP and routing for us (DHCP servers can
     // be off-link as well as on-link).
@@ -377,9 +382,11 @@ public class DhcpClient extends StateMachine {
      */
     public static class Dependencies {
         private final NetworkStackIpMemoryStore mNetworkStackIpMemoryStore;
+        private final IpProvisioningMetrics mMetrics;
 
-        public Dependencies(NetworkStackIpMemoryStore store) {
+        public Dependencies(NetworkStackIpMemoryStore store, IpProvisioningMetrics metrics) {
             mNetworkStackIpMemoryStore = store;
+            mMetrics = metrics;
         }
 
         /**
@@ -403,6 +410,13 @@ public class DhcpClient extends StateMachine {
          */
         public NetworkStackIpMemoryStore getIpMemoryStore() {
             return mNetworkStackIpMemoryStore;
+        }
+
+        /**
+         * Get a IpProvisioningMetrics instance.
+         */
+        public IpProvisioningMetrics getIpProvisioningMetrics() {
+            return mMetrics;
         }
 
         /**
@@ -443,6 +457,7 @@ public class DhcpClient extends StateMachine {
         mController = controller;
         mIfaceName = iface;
         mIpMemoryStore = deps.getIpMemoryStore();
+        mMetrics = deps.getIpProvisioningMetrics();
 
         // CHECKSTYLE:OFF IndentationCheck
         addState(mStoppedState);
@@ -483,6 +498,7 @@ public class DhcpClient extends StateMachine {
         final boolean sendHostname = deps.getSendHostnameOption(context);
         mHostname = sendHostname ? new HostnameTransliterator().transliterate(
                 deps.getDeviceName(mContext)) : null;
+        mMetrics.setHostnameTransinfo(sendHostname, mHostname != null);
     }
 
     public void registerForPreDhcpNotification() {
@@ -502,9 +518,9 @@ public class DhcpClient extends StateMachine {
      * check whether or not to support caching the last lease info and INIT-REBOOT state.
      *
      * INIT-REBOOT state is supported on Android R by default if there is no experiment flag set to
-     * disable this feature explicitly, meanwhile we still hope to be able to control this feature
-     * on/off by pushing experiment flag for A/B testing and metrics collection on both of Android
-     * Q and R version, however it's disbled on Android Q by default.
+     * disable this feature explicitly, meanwhile turning this feature on/off by pushing experiment
+     * flag makes it possible to do A/B test and metrics collection on both of Android Q and R, but
+     * it's disabled on Android Q by default.
      */
     public boolean isDhcpLeaseCacheEnabled() {
         final boolean defaultEnabled =
@@ -526,6 +542,15 @@ public class DhcpClient extends StateMachine {
     public boolean isDhcpIpConflictDetectEnabled() {
         return mDependencies.isFeatureEnabled(mContext, DHCP_IP_CONFLICT_DETECT_VERSION,
                 false /* defaultEnabled */);
+    }
+
+    private void recordMetricEnabledFeatures() {
+        if (isDhcpLeaseCacheEnabled()) mMetrics.setDhcpEnabledFeature(DhcpFeature.DF_INITREBOOT);
+        if (isDhcpRapidCommitEnabled()) mMetrics.setDhcpEnabledFeature(DhcpFeature.DF_RAPIDCOMMIT);
+        if (isDhcpIpConflictDetectEnabled()) mMetrics.setDhcpEnabledFeature(DhcpFeature.DF_DAD);
+        if (mConfiguration.isPreconnectionEnabled) {
+            mMetrics.setDhcpEnabledFeature(DhcpFeature.DF_FILS);
+        }
     }
 
     private void confirmDhcpLease(DhcpPacket packet, DhcpResults results) {
@@ -609,6 +634,7 @@ public class DhcpClient extends StateMachine {
                     EventLog.writeEvent(snetTagId, bugId, uid, data);
                 }
                 mMetricsLog.log(mIfaceName, new DhcpErrorEvent(e.errorCode));
+                mMetrics.addDhcpErrorCode(e.errorCode);
             }
         }
 
@@ -686,6 +712,7 @@ public class DhcpClient extends StateMachine {
         final ByteBuffer packet = DhcpPacket.buildDiscoverPacket(
                 DhcpPacket.ENCAP_L2, mTransactionId, getSecs(), mHwAddr,
                 DO_UNICAST, getRequestedParams(), isDhcpRapidCommitEnabled(), mHostname);
+        mMetrics.incrementCountForDiscover();
         return transmitPacket(packet, "DHCPDISCOVER", DhcpPacket.ENCAP_L2, INADDR_BROADCAST);
     }
 
@@ -704,6 +731,7 @@ public class DhcpClient extends StateMachine {
         String description = "DHCPREQUEST ciaddr=" + clientAddress.getHostAddress() +
                              " request=" + requestedAddress.getHostAddress() +
                              " serverid=" + serverStr;
+        mMetrics.incrementCountForRequest();
         return transmitPacket(packet, description, encap, to);
     }
 
@@ -936,6 +964,7 @@ public class DhcpClient extends StateMachine {
                     } else {
                         startInitRebootOrInit();
                     }
+                    recordMetricEnabledFeatures();
                     return HANDLED;
                 default:
                     return NOT_HANDLED;
@@ -1421,6 +1450,7 @@ public class DhcpClient extends StateMachine {
             try {
                 final ArpPacket packet = ArpPacket.parseArpPacket(recvbuf, length);
                 if (hasIpAddressConflict(packet, mTargetIp)) {
+                    mMetrics.incrementCountForIpConflict();
                     sendMessage(EVENT_IP_CONFLICT);
                 }
             } catch (ArpPacket.ParseException e) {
@@ -1814,6 +1844,7 @@ public class DhcpClient extends StateMachine {
     class DhcpInitRebootState extends DhcpRequestingState {
         @Override
         public void enter() {
+            mTimeout = DHCP_INITREBOOT_TIMEOUT_MS;
             super.enter();
             startNewTransaction();
         }

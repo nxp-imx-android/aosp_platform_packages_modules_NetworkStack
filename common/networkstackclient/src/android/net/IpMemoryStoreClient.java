@@ -22,6 +22,7 @@ import android.content.Context;
 import android.net.ipmemorystore.Blob;
 import android.net.ipmemorystore.NetworkAttributes;
 import android.net.ipmemorystore.OnBlobRetrievedListener;
+import android.net.ipmemorystore.OnDeleteStatusListener;
 import android.net.ipmemorystore.OnL2KeyResponseListener;
 import android.net.ipmemorystore.OnNetworkAttributesRetrievedListener;
 import android.net.ipmemorystore.OnSameL3NetworkResponseListener;
@@ -91,6 +92,7 @@ public abstract class IpMemoryStoreClient {
                     () -> service.storeNetworkAttributes(l2Key, attributes.toParcelable(),
                             OnStatusListener.toAIDL(listener))));
         } catch (ExecutionException m) {
+            if (null == listener) return;
             ignoringRemoteException("Error storing network attributes",
                     () -> listener.onComplete(new Status(Status.ERROR_UNKNOWN)));
         }
@@ -115,6 +117,7 @@ public abstract class IpMemoryStoreClient {
                     () -> service.storeBlob(l2Key, clientId, name, data,
                             OnStatusListener.toAIDL(listener))));
         } catch (ExecutionException m) {
+            if (null == listener) return;
             ignoringRemoteException("Error storing blob",
                     () -> listener.onComplete(new Status(Status.ERROR_UNKNOWN)));
         }
@@ -142,7 +145,8 @@ public abstract class IpMemoryStoreClient {
                             OnL2KeyResponseListener.toAIDL(listener))));
         } catch (ExecutionException m) {
             ignoringRemoteException("Error finding L2 Key",
-                    () -> listener.onL2KeyResponse(new Status(Status.ERROR_UNKNOWN), null));
+                    () -> listener.onL2KeyResponse(new Status(Status.ERROR_UNKNOWN),
+                            null /* l2Key */));
         }
     }
 
@@ -163,7 +167,8 @@ public abstract class IpMemoryStoreClient {
                             OnSameL3NetworkResponseListener.toAIDL(listener))));
         } catch (ExecutionException m) {
             ignoringRemoteException("Error checking for network sameness",
-                    () -> listener.onSameL3NetworkResponse(new Status(Status.ERROR_UNKNOWN), null));
+                    () -> listener.onSameL3NetworkResponse(new Status(Status.ERROR_UNKNOWN),
+                            null /* response */));
         }
     }
 
@@ -185,7 +190,7 @@ public abstract class IpMemoryStoreClient {
         } catch (ExecutionException m) {
             ignoringRemoteException("Error retrieving network attributes",
                     () -> listener.onNetworkAttributesRetrieved(new Status(Status.ERROR_UNKNOWN),
-                            null, null));
+                            null /* l2Key */, null /* attributes */));
         }
     }
 
@@ -209,7 +214,67 @@ public abstract class IpMemoryStoreClient {
         } catch (ExecutionException m) {
             ignoringRemoteException("Error retrieving blob",
                     () -> listener.onBlobRetrieved(new Status(Status.ERROR_UNKNOWN),
-                            null, null, null));
+                            null /* l2Key */, null /* name */, null /* blob */));
+        }
+    }
+
+    /**
+     * Delete a single entry.
+     *
+     * @param l2Key The L2 key of the entry to delete.
+     * @param needWipe Whether the data must be wiped from disk immediately. This makes the
+     *                 operation vastly more expensive as the database files will have to be copied
+     *                 and created again from the old files (see sqlite3 VACUUM operation for
+     *                 details) and makes no functional difference; only pass true if security or
+     *                 privacy demands this data must be removed from disk immediately.
+     *                 Note that this can fail for storage reasons. The passed listener will then
+     *                 receive an appropriate error status with the number of deleted rows.
+     * @param listener A listener that will be invoked to inform of the completion of this call,
+     *                 or null if the client is not interested in learning about success/failure.
+     * returns (through the listener) A status to indicate success and the number of deleted records
+     */
+    public void delete(@NonNull final String l2Key, final boolean needWipe,
+            @Nullable final OnDeleteStatusListener listener) {
+        try {
+            runWhenServiceReady(service -> ignoringRemoteException(() ->
+                    service.delete(l2Key, needWipe, OnDeleteStatusListener.toAIDL(listener))));
+        } catch (ExecutionException m) {
+            if (null == listener) return;
+            ignoringRemoteException("Error deleting from the memory store",
+                    () -> listener.onComplete(new Status(Status.ERROR_UNKNOWN),
+                            0 /* deletedRecords */));
+        }
+    }
+
+    /**
+     * Delete all entries in a cluster.
+     *
+     * This method will delete all entries in the memory store that have the cluster attribute
+     * passed as an argument.
+     *
+     * @param cluster The cluster to delete.
+     * @param needWipe Whether the data must be wiped from disk immediately. This makes the
+     *                 operation vastly more expensive as the database files will have to be copied
+     *                 and created again from the old files (see sqlite3 VACUUM operation for
+     *                 details) and makes no functional difference; only pass true if security or
+     *                 privacy demands this data must be removed from disk immediately.
+     *                 Note that this can fail for storage reasons. The passed listener will then
+     *                 receive an appropriate error status with the number of deleted rows.
+     * @param listener A listener that will be invoked to inform of the completion of this call,
+     *                 or null if the client is not interested in learning about success/failure.
+     * returns (through the listener) A status to indicate success and the number of deleted records
+     */
+    public void deleteCluster(@NonNull final String cluster, final boolean needWipe,
+            @Nullable final OnDeleteStatusListener listener) {
+        try {
+            runWhenServiceReady(service -> ignoringRemoteException(
+                    () -> service.deleteCluster(cluster, needWipe,
+                            OnDeleteStatusListener.toAIDL(listener))));
+        } catch (ExecutionException m) {
+            if (null == listener) return;
+            ignoringRemoteException("Error deleting from the memory store",
+                    () -> listener.onComplete(new Status(Status.ERROR_UNKNOWN),
+                            0 /* deletedRecords */));
         }
     }
 

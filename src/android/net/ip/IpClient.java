@@ -17,7 +17,7 @@
 package android.net.ip;
 
 import static android.net.RouteInfo.RTN_UNICAST;
-import static android.net.shared.IpConfigurationParcelableUtil.toStableParcelable;
+import static android.net.dhcp.DhcpResultsParcelableUtil.toStableParcelable;
 import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 
 import static com.android.server.util.NetworkStackConstants.VENDOR_SPECIFIC_IE_ID;
@@ -60,6 +60,7 @@ import android.os.Message;
 import android.os.RemoteException;
 import android.os.ServiceSpecificException;
 import android.os.SystemClock;
+import android.stats.connectivity.DisconnectCode;
 import android.text.TextUtils;
 import android.util.LocalLog;
 import android.util.Log;
@@ -79,6 +80,7 @@ import com.android.internal.util.WakeupMessage;
 import com.android.networkstack.apishim.NetworkInformationShimImpl;
 import com.android.networkstack.apishim.common.NetworkInformationShim;
 import com.android.networkstack.apishim.common.ShimUtils;
+import com.android.networkstack.metrics.IpProvisioningMetrics;
 import com.android.server.NetworkObserverRegistry;
 import com.android.server.NetworkStackService.NetworkStackServiceManager;
 
@@ -129,6 +131,7 @@ public class IpClient extends StateMachine {
     private static final ConcurrentHashMap<String, LocalLog> sPktLogs = new ConcurrentHashMap<>();
     private final NetworkStackIpMemoryStore mIpMemoryStore;
     private final NetworkInformationShim mShim = NetworkInformationShimImpl.newInstance();
+    private final IpProvisioningMetrics mIpProvisioningMetrics = new IpProvisioningMetrics();
 
     /**
      * Dump all state machine and connectivity packet logs to the specified writer.
@@ -382,9 +385,12 @@ public class IpClient extends StateMachine {
     private static final int EVENT_READ_PACKET_FILTER_COMPLETE    = 12;
     private static final int CMD_ADD_KEEPALIVE_PACKET_FILTER_TO_APF = 13;
     private static final int CMD_REMOVE_KEEPALIVE_PACKET_FILTER_FROM_APF = 14;
-    private static final int CMD_UPDATE_L2KEY_GROUPHINT = 15;
+    private static final int CMD_UPDATE_L2KEY_CLUSTER = 15;
     private static final int CMD_COMPLETE_PRECONNECTION = 16;
     private static final int CMD_UPDATE_L2INFORMATION = 17;
+
+    private static final int ARG_LINKPROP_CHANGED_LINKSTATE_DOWN = 0;
+    private static final int ARG_LINKPROP_CHANGED_LINKSTATE_UP = 1;
 
     // Internal commands to use instead of trying to call transitionTo() inside
     // a given State's enter() method. Calling transitionTo() from enter/exit
@@ -478,10 +484,11 @@ public class IpClient extends StateMachine {
     private ProxyInfo mHttpProxy;
     private ApfFilter mApfFilter;
     private String mL2Key; // The L2 key for this network, for writing into the memory store
-    private String mGroupHint; // The group hint for this network, for writing into the memory store
+    private String mCluster; // The cluster for this network, for writing into the memory store
     private boolean mMulticastFiltering;
     private long mStartTimeMillis;
     private MacAddress mCurrentBssid;
+    private boolean mHasDisabledIPv6OnProvLoss;
 
     /**
      * Reading the snapshot is an asynchronous operation initiated by invoking
@@ -526,8 +533,8 @@ public class IpClient extends StateMachine {
          * Get a DhcpClient Dependencies instance.
          */
         public DhcpClient.Dependencies getDhcpClientDependencies(
-                NetworkStackIpMemoryStore ipMemoryStore) {
-            return new DhcpClient.Dependencies(ipMemoryStore);
+                NetworkStackIpMemoryStore ipMemoryStore, IpProvisioningMetrics metrics) {
+            return new DhcpClient.Dependencies(ipMemoryStore, metrics);
         }
 
         /**
@@ -592,7 +599,9 @@ public class IpClient extends StateMachine {
         mLinkObserver = new IpClientLinkObserver(
                 mContext, getHandler(),
                 mInterfaceName,
-                () -> sendMessage(EVENT_NETLINK_LINKPROPERTIES_CHANGED),
+                (ifaceUp) -> sendMessage(EVENT_NETLINK_LINKPROPERTIES_CHANGED, ifaceUp
+                        ? ARG_LINKPROP_CHANGED_LINKSTATE_UP
+                        : ARG_LINKPROP_CHANGED_LINKSTATE_DOWN),
                 config, mLog) {
             @Override
             public void onInterfaceAdded(String iface) {
@@ -687,9 +696,9 @@ public class IpClient extends StateMachine {
             IpClient.this.stop();
         }
         @Override
-        public void setL2KeyAndGroupHint(String l2Key, String groupHint) {
+        public void setL2KeyAndGroupHint(String l2Key, String cluster) {
             enforceNetworkStackCallingPermission();
-            IpClient.this.setL2KeyAndGroupHint(l2Key, groupHint);
+            IpClient.this.setL2KeyAndCluster(l2Key, cluster);
         }
         @Override
         public void setTcpBufferSizes(String tcpBufferSizes) {
@@ -806,7 +815,7 @@ public class IpClient extends StateMachine {
 
         if (req.mLayer2Info != null) {
             mL2Key = req.mLayer2Info.mL2Key;
-            mGroupHint = req.mLayer2Info.mGroupHint;
+            mCluster = req.mLayer2Info.mCluster;
         }
         sendMessage(CMD_START, new android.net.shared.ProvisioningConfiguration(req));
     }
@@ -815,9 +824,12 @@ public class IpClient extends StateMachine {
      * Stop this IpClient.
      *
      * <p>This does not shut down the StateMachine itself, which is handled by {@link #shutdown()}.
+     *    The message "arg1" parameter is used to record the disconnect code metrics.
+     *    Usually this method is called by the peer (e.g. wifi) intentionally to stop IpClient,
+     *    consider that's the normal user termination.
      */
     public void stop() {
-        sendMessage(CMD_STOP);
+        sendMessage(CMD_STOP, DisconnectCode.DC_NORMAL_TERMINATION.getNumber());
     }
 
     /**
@@ -854,14 +866,14 @@ public class IpClient extends StateMachine {
     }
 
     /**
-     * Set the L2 key and group hint for storing info into the memory store.
+     * Set the L2 key and cluster for storing info into the memory store.
      *
      * This method is only supported on Q devices. For R or above releases,
      * caller should call #updateLayer2Information() instead.
      */
-    public void setL2KeyAndGroupHint(String l2Key, String groupHint) {
+    public void setL2KeyAndCluster(String l2Key, String cluster) {
         if (!ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q)) {
-            sendMessage(CMD_UPDATE_L2KEY_GROUPHINT, new Pair<>(l2Key, groupHint));
+            sendMessage(CMD_UPDATE_L2KEY_CLUSTER, new Pair<>(l2Key, cluster));
         }
     }
 
@@ -918,7 +930,7 @@ public class IpClient extends StateMachine {
     }
 
     /**
-     * Update the network bssid, L2Key and GroupHint on L2 roaming happened.
+     * Update the network bssid, L2Key and cluster on L2 roaming happened.
      */
     public void updateLayer2Information(@NonNull Layer2InformationParcelable info) {
         sendMessage(CMD_UPDATE_L2INFORMATION, info);
@@ -1071,6 +1083,12 @@ public class IpClient extends StateMachine {
         mMetricsLog.log(mInterfaceName, new IpManagerEvent(type, duration));
     }
 
+    // Record the DisconnectCode and transition to StoppingState.
+    private void transitionToStoppingState(final DisconnectCode code) {
+        mIpProvisioningMetrics.setDisconnectCode(code);
+        transitionTo(mStoppingState);
+    }
+
     // For now: use WifiStateMachine's historical notion of provisioned.
     @VisibleForTesting
     static boolean isProvisioned(LinkProperties lp, InitialConfiguration config) {
@@ -1137,9 +1155,9 @@ public class IpClient extends StateMachine {
         // Note that we can still be disconnected by IpReachabilityMonitor
         // if the IPv6 default gateway (but not the IPv6 DNS servers; see
         // accompanying code in IpReachabilityMonitor) is unreachable.
-        final boolean ignoreIPv6ProvisioningLoss =
-                mConfiguration != null && mConfiguration.mUsingMultinetworkPolicyTracker
-                && !mCm.shouldAvoidBadWifi();
+        final boolean ignoreIPv6ProvisioningLoss = mHasDisabledIPv6OnProvLoss
+                || (mConfiguration != null && mConfiguration.mUsingMultinetworkPolicyTracker
+                        && !mCm.shouldAvoidBadWifi());
 
         // Additionally:
         //
@@ -1163,7 +1181,23 @@ public class IpClient extends StateMachine {
         // IPv6 default route then also consider the loss of that default route
         // to be a loss of provisioning. See b/27962810.
         if (oldLp.hasGlobalIpv6Address() && (lostIPv6Router && !ignoreIPv6ProvisioningLoss)) {
-            delta = PROV_CHANGE_LOST_PROVISIONING;
+            // Although link properties have lost IPv6 default route in this case, if IPv4 is still
+            // working with appropriate routes and DNS servers, we can keep the current connection
+            // without disconnecting from the network, just disable IPv6 on that given network until
+            // to the next provisioning. Disabling IPv6 will result in all IPv6 connectivity torn
+            // down and all IPv6 sockets being closed, the non-routable IPv6 DNS servers will be
+            // stripped out, so applications will be able to reconnect immediately over IPv4. See
+            // b/131781810.
+            if (newLp.isIpv4Provisioned()) {
+                mInterfaceCtrl.disableIPv6();
+                mHasDisabledIPv6OnProvLoss = true;
+                delta = PROV_CHANGE_STILL_PROVISIONED;
+                if (DBG) {
+                    mLog.log("Disable IPv6 stack completely when the default router has gone");
+                }
+            } else {
+                delta = PROV_CHANGE_LOST_PROVISIONING;
+            }
         }
 
         return delta;
@@ -1335,6 +1369,12 @@ public class IpClient extends StateMachine {
         if (Objects.equals(newLp, mLinkProperties)) {
             return true;
         }
+
+        // Either success IPv4 or IPv6 provisioning triggers new LinkProperties update,
+        // wait for the provisioning completion and record the latency.
+        mIpProvisioningMetrics.setIPv4ProvisionedLatencyOnFirstTime(newLp.isIpv4Provisioned());
+        mIpProvisioningMetrics.setIPv6ProvisionedLatencyOnFirstTime(newLp.isIpv6Provisioned());
+
         final int delta = setLinkProperties(newLp);
         // Most of the attributes stored in the memory store are deduced from
         // the link properties, therefore when the properties update the memory
@@ -1430,10 +1470,10 @@ public class IpClient extends StateMachine {
         }
         mCallback.onNewDhcpResults(null);
 
-        handleProvisioningFailure();
+        handleProvisioningFailure(DisconnectCode.DC_PROVISIONING_FAIL);
     }
 
-    private void handleProvisioningFailure() {
+    private void handleProvisioningFailure(final DisconnectCode code) {
         final LinkProperties newLp = assembleLinkProperties();
         int delta = setLinkProperties(newLp);
         // If we've gotten here and we're still not provisioned treat that as
@@ -1450,7 +1490,7 @@ public class IpClient extends StateMachine {
 
         dispatchCallback(delta, newLp);
         if (delta == PROV_CHANGE_LOST_PROVISIONING) {
-            transitionTo(mStoppingState);
+            transitionToStoppingState(code);
         }
     }
 
@@ -1559,7 +1599,7 @@ public class IpClient extends StateMachine {
 
     private void handleUpdateL2Information(@NonNull Layer2InformationParcelable info) {
         mL2Key = info.l2Key;
-        mGroupHint = info.groupHint;
+        mCluster = info.cluster;
 
         if (info.bssid == null || mCurrentBssid == null) {
             Log.wtf(mTag, "bssid in the parcelable or current tracked bssid should be non-null");
@@ -1591,6 +1631,7 @@ public class IpClient extends StateMachine {
         @Override
         public void enter() {
             stopAllIP();
+            mHasDisabledIPv6OnProvLoss = false;
 
             mLinkObserver.clearInterfaceParams();
             resetLinkProperties();
@@ -1633,10 +1674,10 @@ public class IpClient extends StateMachine {
                     handleLinkPropertiesUpdate(NO_CALLBACKS);
                     break;
 
-                case CMD_UPDATE_L2KEY_GROUPHINT: {
+                case CMD_UPDATE_L2KEY_CLUSTER: {
                     final Pair<String, String> args = (Pair<String, String>) msg.obj;
                     mL2Key = args.first;
-                    mGroupHint = args.second;
+                    mCluster = args.second;
                     break;
                 }
 
@@ -1705,7 +1746,7 @@ public class IpClient extends StateMachine {
     private void startDhcpClient() {
         // Start DHCPv4.
         mDhcpClient = mDependencies.makeDhcpClient(mContext, IpClient.this, mInterfaceParams,
-                mDependencies.getDhcpClientDependencies(mIpMemoryStore));
+                mDependencies.getDhcpClientDependencies(mIpMemoryStore, mIpProvisioningMetrics));
 
         // If preconnection is enabled, there is no need to ask Wi-Fi to disable powersaving
         // during DHCP, because the DHCP handshake will happen during association. In order to
@@ -1726,7 +1767,8 @@ public class IpClient extends StateMachine {
             if (mInterfaceParams == null) {
                 logError("Failed to find InterfaceParams for " + mInterfaceName);
                 doImmediateProvisioningFailure(IpManagerEvent.ERROR_INTERFACE_NOT_FOUND);
-                deferMessage(obtainMessage(CMD_STOP));
+                deferMessage(obtainMessage(CMD_STOP,
+                        DisconnectCode.DC_INTERFACE_NOT_FOUND.getNumber()));
                 return;
             }
 
@@ -1754,7 +1796,7 @@ public class IpClient extends StateMachine {
                 case EVENT_NETLINK_LINKPROPERTIES_CHANGED:
                     handleLinkPropertiesUpdate(NO_CALLBACKS);
                     if (readyToProceed()) {
-                        transitionTo(mRunningState);
+                        transitionTo(isUsingPreconnection() ? mPreconnectingState : mRunningState);
                     }
                     break;
 
@@ -1818,6 +1860,7 @@ public class IpClient extends StateMachine {
     class StartedState extends State {
         @Override
         public void enter() {
+            mIpProvisioningMetrics.reset();
             mStartTimeMillis = SystemClock.elapsedRealtime();
             if (mConfiguration.mProvisioningTimeoutMs > 0) {
                 final long alarmTime = SystemClock.elapsedRealtime()
@@ -1829,19 +1872,23 @@ public class IpClient extends StateMachine {
         @Override
         public void exit() {
             mProvisioningTimeoutAlarm.cancel();
+
+            // Record metrics information once this provisioning has completed due to certain
+            // reason (normal termination, provisioning timeout, lost provisioning and etc).
+            mIpProvisioningMetrics.statsWrite();
         }
 
         @Override
         public boolean processMessage(Message msg) {
             switch (msg.what) {
                 case CMD_STOP:
-                    transitionTo(mStoppingState);
+                    transitionToStoppingState(DisconnectCode.forNumber(msg.arg1));
                     break;
 
-                case CMD_UPDATE_L2KEY_GROUPHINT: {
+                case CMD_UPDATE_L2KEY_CLUSTER: {
                     final Pair<String, String> args = (Pair<String, String>) msg.obj;
                     mL2Key = args.first;
-                    mGroupHint = args.second;
+                    mCluster = args.second;
                     // TODO : attributes should be saved to the memory store with
                     // these new values if they differ from the previous ones.
                     // If the state machine is in pure StartedState, then the values to input
@@ -1857,7 +1904,7 @@ public class IpClient extends StateMachine {
                     break;
 
                 case EVENT_PROVISIONING_TIMEOUT:
-                    handleProvisioningFailure();
+                    handleProvisioningFailure(DisconnectCode.DC_PROVISIONING_TIMEOUT);
                     break;
 
                 default:
@@ -1894,13 +1941,13 @@ public class IpClient extends StateMachine {
 
             if (mConfiguration.mEnableIPv6 && !startIPv6()) {
                 doImmediateProvisioningFailure(IpManagerEvent.ERROR_STARTING_IPV6);
-                enqueueJumpToStoppingState();
+                enqueueJumpToStoppingState(DisconnectCode.DC_ERROR_STARTING_IPV6);
                 return;
             }
 
             if (mConfiguration.mEnableIPv4 && !isUsingPreconnection() && !startIPv4()) {
                 doImmediateProvisioningFailure(IpManagerEvent.ERROR_STARTING_IPV4);
-                enqueueJumpToStoppingState();
+                enqueueJumpToStoppingState(DisconnectCode.DC_ERROR_STARTING_IPV4);
                 return;
             }
 
@@ -1908,14 +1955,14 @@ public class IpClient extends StateMachine {
             if ((config != null) && !applyInitialConfig(config)) {
                 // TODO introduce a new IpManagerEvent constant to distinguish this error case.
                 doImmediateProvisioningFailure(IpManagerEvent.ERROR_INVALID_PROVISIONING);
-                enqueueJumpToStoppingState();
+                enqueueJumpToStoppingState(DisconnectCode.DC_INVALID_PROVISIONING);
                 return;
             }
 
             if (mConfiguration.mUsingIpReachabilityMonitor && !startIpReachabilityMonitor()) {
                 doImmediateProvisioningFailure(
                         IpManagerEvent.ERROR_STARTING_IPREACHABILITYMONITOR);
-                enqueueJumpToStoppingState();
+                enqueueJumpToStoppingState(DisconnectCode.DC_ERROR_STARTING_IPREACHABILITYMONITOR);
                 return;
             }
         }
@@ -1947,8 +1994,8 @@ public class IpClient extends StateMachine {
             resetLinkProperties();
         }
 
-        private void enqueueJumpToStoppingState() {
-            deferMessage(obtainMessage(CMD_JUMP_RUNNING_TO_STOPPING));
+        private void enqueueJumpToStoppingState(final DisconnectCode code) {
+            deferMessage(obtainMessage(CMD_JUMP_RUNNING_TO_STOPPING, code.getNumber()));
         }
 
         private ConnectivityPacketTracker createPacketTracker() {
@@ -1983,7 +2030,7 @@ public class IpClient extends StateMachine {
             switch (msg.what) {
                 case CMD_JUMP_RUNNING_TO_STOPPING:
                 case CMD_STOP:
-                    transitionTo(mStoppingState);
+                    transitionToStoppingState(DisconnectCode.forNumber(msg.arg1));
                     break;
 
                 case CMD_START:
@@ -2010,8 +2057,16 @@ public class IpClient extends StateMachine {
                     break;
 
                 case EVENT_NETLINK_LINKPROPERTIES_CHANGED:
+                    // EVENT_NETLINK_LINKPROPERTIES_CHANGED message will be received in both of
+                    // provisioning loss and normal user termination cases (e.g. turn off wifi or
+                    // switch to another wifi ssid), hence, checking the current interface link
+                    // state (down or up) helps distinguish the two cases: if the link state is
+                    // down, provisioning is only lost because the link is being torn down (for
+                    // example when turning off wifi), so treat it as a normal termination.
                     if (!handleLinkPropertiesUpdate(SEND_CALLBACKS)) {
-                        transitionTo(mStoppingState);
+                        final boolean linkStateUp = (msg.arg1 == ARG_LINKPROP_CHANGED_LINKSTATE_UP);
+                        transitionToStoppingState(linkStateUp ? DisconnectCode.DC_PROVISIONING_FAIL
+                                : DisconnectCode.DC_NORMAL_TERMINATION);
                     }
                     break;
 
@@ -2091,7 +2146,7 @@ public class IpClient extends StateMachine {
                     } else {
                         logError("Failed to set IPv4 address.");
                         dispatchCallback(PROV_CHANGE_LOST_PROVISIONING, mLinkProperties);
-                        transitionTo(mStoppingState);
+                        transitionToStoppingState(DisconnectCode.DC_PROVISIONING_FAIL);
                     }
                     break;
                 }
