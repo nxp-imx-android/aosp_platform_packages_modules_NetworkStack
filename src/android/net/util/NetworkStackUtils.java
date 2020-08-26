@@ -18,10 +18,12 @@ package android.net.util;
 
 import android.content.Context;
 import android.content.pm.PackageManager.NameNotFoundException;
+import android.content.res.Resources;
 import android.provider.DeviceConfig;
 import android.util.Log;
 import android.util.SparseArray;
 
+import androidx.annotation.BoolRes;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
@@ -226,6 +228,15 @@ public class NetworkStackUtils {
     public static final String DNS_PROBE_PRIVATE_IP_NO_INTERNET_VERSION =
             "dns_probe_private_ip_no_internet";
 
+    /**
+     * Experiment flag to enable validation metrics sent by NetworkMonitor.
+     *
+     * Metrics are sent by default. They can be disabled by setting the flag to a number greater
+     * than the APK version (for example 999999999).
+     * @see #isFeatureEnabled(Context, String, String, boolean)
+     */
+    public static final String VALIDATION_METRICS_VERSION = "validation_metrics_version";
+
     static {
         System.loadLibrary("networkstackutilsjni");
     }
@@ -348,6 +359,9 @@ public class NetworkStackUtils {
      * {@link DeviceConfig} is enabled by comparing NetworkStack module version {@link NetworkStack}
      * with current version of property. If this property version is valid, the corresponding
      * experimental feature would be enabled, otherwise disabled.
+     *
+     * This is useful to ensure that if a module install is rolled back, flags are not left fully
+     * rolled out on a version where they have not been well tested.
      * @param context The global context information about an app environment.
      * @param namespace The namespace containing the property to look up.
      * @param name The name of the property to look up.
@@ -363,6 +377,9 @@ public class NetworkStackUtils {
      * {@link DeviceConfig} is enabled by comparing NetworkStack module version {@link NetworkStack}
      * with current version of property. If this property version is valid, the corresponding
      * experimental feature would be enabled, otherwise disabled.
+     *
+     * This is useful to ensure that if a module install is rolled back, flags are not left fully
+     * rolled out on a version where they have not been well tested.
      * @param context The global context information about an app environment.
      * @param namespace The namespace containing the property to look up.
      * @param name The name of the property to look up.
@@ -435,5 +452,36 @@ public class NetworkStackUtils {
     public static boolean isIPv6ULA(@Nullable InetAddress addr) {
         return addr instanceof Inet6Address
                 && ((addr.getAddress()[0] & 0xfe) == 0xfc);
+    }
+
+    /**
+     * Returns the {@code int} nearest in value to {@code value}.
+     *
+     * @param value any {@code long} value
+     * @return the same value cast to {@code int} if it is in the range of the {@code int}
+     * type, {@link Integer#MAX_VALUE} if it is too large, or {@link Integer#MIN_VALUE} if
+     * it is too small
+     */
+    public static int saturatedCast(long value) {
+        if (value > Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        if (value < Integer.MIN_VALUE) {
+            return Integer.MIN_VALUE;
+        }
+        return (int) value;
+    }
+
+    /**
+     * Gets boolean config from resources.
+     */
+    public static boolean getResBooleanConfig(@NonNull final Context context,
+            @BoolRes int configResource, final boolean defaultValue) {
+        final Resources res = context.getResources();
+        try {
+            return res.getBoolean(configResource);
+        } catch (Resources.NotFoundException e) {
+            return defaultValue;
+        }
     }
 }
