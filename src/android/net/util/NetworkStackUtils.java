@@ -18,10 +18,12 @@ package android.net.util;
 
 import android.content.Context;
 import android.content.pm.PackageManager.NameNotFoundException;
+import android.content.res.Resources;
 import android.provider.DeviceConfig;
 import android.util.Log;
 import android.util.SparseArray;
 
+import androidx.annotation.BoolRes;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
@@ -208,6 +210,12 @@ public class NetworkStackUtils {
      * Minimum module version at which to enable the IP address conflict detection feature.
      */
     public static final String DHCP_IP_CONFLICT_DETECT_VERSION = "dhcp_ip_conflict_detect_version";
+
+    /**
+     * Minimum module version at which to enable the IPv6-Only preferred option.
+     */
+    public static final String DHCP_IPV6_ONLY_PREFERRED_VERSION =
+            "dhcp_ipv6_only_preferred_version";
 
     /**
      * Minimum module version at which to enable dismissal CaptivePortalLogin app in validated
@@ -468,5 +476,18 @@ public class NetworkStackUtils {
             return Integer.MIN_VALUE;
         }
         return (int) value;
+    }
+
+    /**
+     * Gets boolean config from resources.
+     */
+    public static boolean getResBooleanConfig(@NonNull final Context context,
+            @BoolRes int configResource, final boolean defaultValue) {
+        final Resources res = context.getResources();
+        try {
+            return res.getBoolean(configResource);
+        } catch (Resources.NotFoundException e) {
+            return defaultValue;
+        }
     }
 }
