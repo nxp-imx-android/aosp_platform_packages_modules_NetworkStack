@@ -19,11 +19,13 @@ package android.net.ip;
 import static android.net.dhcp.DhcpClient.EXPIRED_LEASE;
 import static android.net.dhcp.DhcpPacket.DHCP_BOOTREQUEST;
 import static android.net.dhcp.DhcpPacket.DHCP_CLIENT;
+import static android.net.dhcp.DhcpPacket.DHCP_IPV6_ONLY_PREFERRED;
 import static android.net.dhcp.DhcpPacket.DHCP_MAGIC_COOKIE;
 import static android.net.dhcp.DhcpPacket.DHCP_SERVER;
 import static android.net.dhcp.DhcpPacket.ENCAP_L2;
 import static android.net.dhcp.DhcpPacket.INADDR_BROADCAST;
 import static android.net.dhcp.DhcpPacket.INFINITE_LEASE;
+import static android.net.dhcp.DhcpPacket.MIN_V6ONLY_WAIT_MS;
 import static android.net.dhcp.DhcpResultsParcelableUtil.fromStableParcelable;
 import static android.net.ipmemorystore.Status.SUCCESS;
 import static android.system.OsConstants.ETH_P_IPV6;
@@ -46,6 +48,7 @@ import static com.android.server.util.NetworkStackConstants.ICMPV6_ND_OPTION_RDN
 import static com.android.server.util.NetworkStackConstants.ICMPV6_RA_HEADER_LEN;
 import static com.android.server.util.NetworkStackConstants.ICMPV6_ROUTER_ADVERTISEMENT;
 import static com.android.server.util.NetworkStackConstants.ICMPV6_ROUTER_SOLICITATION;
+import static com.android.server.util.NetworkStackConstants.IPV4_ADDR_ANY;
 import static com.android.server.util.NetworkStackConstants.IPV6_HEADER_LEN;
 import static com.android.server.util.NetworkStackConstants.IPV6_LEN_OFFSET;
 import static com.android.server.util.NetworkStackConstants.IPV6_PROTOCOL_OFFSET;
@@ -66,10 +69,12 @@ import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.longThat;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.argThat;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.spy;
@@ -110,6 +115,7 @@ import android.net.ipmemorystore.NetworkAttributes;
 import android.net.ipmemorystore.OnNetworkAttributesRetrievedListener;
 import android.net.ipmemorystore.Status;
 import android.net.netlink.StructNdOptPref64;
+import android.net.networkstack.TestNetworkStackServiceClient;
 import android.net.shared.Layer2Information;
 import android.net.shared.ProvisioningConfiguration;
 import android.net.shared.ProvisioningConfiguration.ScanResultInfo;
@@ -120,6 +126,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.ParcelFileDescriptor;
 import android.os.PowerManager;
 import android.os.RemoteException;
 import android.os.SystemClock;
@@ -127,6 +134,7 @@ import android.os.SystemProperties;
 import android.system.ErrnoException;
 import android.system.Os;
 
+import androidx.annotation.NonNull;
 import androidx.test.InstrumentationRegistry;
 import androidx.test.filters.SmallTest;
 import androidx.test.runner.AndroidJUnit4;
@@ -150,9 +158,9 @@ import com.android.testutils.TapPacketReader;
 
 import org.junit.After;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestName;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
@@ -160,8 +168,15 @@ import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.mockito.Spy;
 
+import java.io.BufferedReader;
 import java.io.FileDescriptor;
+import java.io.FileReader;
 import java.io.IOException;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+import java.lang.reflect.Method;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
@@ -184,28 +199,57 @@ import kotlin.Lazy;
 import kotlin.LazyKt;
 
 /**
- * Tests for IpClient.
+ * Base class for IpClient tests.
+ *
+ * Tests in this class can either be run with signature permissions, or with root access.
  */
 @RunWith(AndroidJUnit4.class)
 @SmallTest
-public class IpClientIntegrationTest {
+public abstract class IpClientIntegrationTestCommon {
     private static final int DATA_BUFFER_LEN = 4096;
     private static final int PACKET_TIMEOUT_MS = 5_000;
-    private static final int TEST_TIMEOUT_MS = 2_000;
     private static final String TEST_L2KEY = "some l2key";
     private static final String TEST_CLUSTER = "some cluster";
     private static final int TEST_LEASE_DURATION_S = 3_600; // 1 hour
+    private static final int TEST_IPV6_ONLY_WAIT_S = 1_800; // 30 min
+    private static final int TEST_LOWER_IPV6_ONLY_WAIT_S = (int) (MIN_V6ONLY_WAIT_MS / 1000 - 1);
+    private static final int TEST_ZERO_IPV6_ONLY_WAIT_S = 0;
+    private static final long TEST_MAX_IPV6_ONLY_WAIT_S = 0xffffffffL;
 
     // TODO: move to NetlinkConstants, NetworkStackConstants, or OsConstants.
     private static final int IFA_F_STABLE_PRIVACY = 0x800;
 
+    protected static final long TEST_TIMEOUT_MS = 2_000L;
+
     @Rule
     public final DevSdkIgnoreRule mIgnoreRule = new DevSdkIgnoreRule();
+    @Rule
+    public final TestName mTestNameRule = new TestName();
+
+    /**
+     * Indicates that a test requires signature permissions to run.
+     *
+     * Such tests can only be run on devices that use known signing keys, so this annotation must be
+     * avoided as much as possible. Consider whether the test can be written to use shell and root
+     * shell permissions, and run against the NetworkStack AIDL interface (IIpClient) instead.
+     */
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target({ElementType.METHOD})
+    private @interface SignatureRequiredTest {
+        String reason();
+    }
+
+    /**** BEGIN signature required test members ****/
+    // Do not use unless the test *really* cannot be written to exercise IIpClient without mocks.
+    // Tests using the below members must be annotated with @SignatureRequiredTest (otherwise the
+    // members will be null), and can only be run on devices that use known signing keys.
+    // The members could technically be moved to the IpClientIntegrationTest subclass together with
+    // the tests requiring signature permissions, but this would make it harder to follow tests in
+    // multiple classes, and harder to migrate tests between signature required and not required.
 
     @Mock private Context mContext;
     @Mock private ConnectivityManager mCm;
     @Mock private Resources mResources;
-    @Mock private IIpClientCallbacks mCb;
     @Mock private AlarmManager mAlarm;
     @Mock private ContentResolver mContentResolver;
     @Mock private NetworkStackServiceManager mNetworkStackServiceManager;
@@ -214,16 +258,23 @@ public class IpClientIntegrationTest {
     @Mock private PowerManager.WakeLock mTimeoutWakeLock;
 
     @Spy private INetd mNetd;
-
-    private String mIfaceName;
     private NetworkObserverRegistry mNetworkObserverRegistry;
+
+    protected IpClient mIpc;
+    protected Dependencies mDependencies;
+
+    /***** END signature required test members *****/
+
+    private IIpClientCallbacks mCb;
+    private IIpClient mIIpClient;
+    private String mIfaceName;
     private HandlerThread mPacketReaderThread;
     private Handler mHandler;
     private TapPacketReader mPacketReader;
     private FileDescriptor mTapFd;
-    private IpClient mIpc;
-    private Dependencies mDependencies;
     private byte[] mClientMac;
+
+    private boolean mIsSignatureRequiredTest;
 
     // ReadHeads for various packet streams. Cannot be initialized in @Before because ReadHead is
     // single-thread-only, and AndroidJUnitRunner runs @Before and @Test on different threads.
@@ -286,7 +337,7 @@ public class IpClientIntegrationTest {
     private static final String TEST_DHCP_ROAM_CLUSTER = "roaming_cluster";
     private static final byte[] TEST_AP_OUI = new byte[] { 0x00, 0x1A, 0x11 };
 
-    private class Dependencies extends IpClient.Dependencies {
+    protected class Dependencies extends IpClient.Dependencies {
         private boolean mIsDhcpLeaseCacheEnabled;
         private boolean mIsDhcpRapidCommitEnabled;
         private boolean mIsDhcpIpConflictDetectEnabled;
@@ -296,6 +347,7 @@ public class IpClientIntegrationTest {
         private boolean mIsHostnameConfigurationEnabled;
         private String mHostname;
         private boolean mIsInterfaceRecovered;
+        private boolean mIsIPv6OnlyPreferredEnabled;
 
         public void setDhcpLeaseCacheEnabled(final boolean enable) {
             mIsDhcpLeaseCacheEnabled = enable;
@@ -307,6 +359,10 @@ public class IpClientIntegrationTest {
 
         public void setDhcpIpConflictDetectEnabled(final boolean enable) {
             mIsDhcpIpConflictDetectEnabled = enable;
+        }
+
+        public void setIPv6OnlyPreferredEnabled(final boolean enable) {
+            mIsIPv6OnlyPreferredEnabled = enable;
         }
 
         public void setHostnameConfiguration(final boolean enable, final String hostname) {
@@ -363,6 +419,8 @@ public class IpClientIntegrationTest {
                             return mIsDhcpLeaseCacheEnabled;
                         case NetworkStackUtils.DHCP_IP_CONFLICT_DETECT_VERSION:
                             return mIsDhcpIpConflictDetectEnabled;
+                        case NetworkStackUtils.DHCP_IPV6_ONLY_PREFERRED_VERSION:
+                            return mIsIPv6OnlyPreferredEnabled;
                         default:
                             fail("Invalid experiment flag: " + name);
                             return false;
@@ -406,8 +464,41 @@ public class IpClientIntegrationTest {
         }
     }
 
+    @NonNull
+    protected abstract IIpClient makeIIpClient(
+            @NonNull String ifaceName, @NonNull IIpClientCallbacks cb);
+
+    protected abstract void setDhcpFeatures(boolean isDhcpLeaseCacheEnabled,
+            boolean isRapidCommitEnabled, boolean isDhcpIpConflictDetectEnabled);
+
+    protected abstract boolean useNetworkStackSignature();
+
+    protected final boolean testSkipped() {
+        // TODO: split out a test suite for root tests, and fail hard instead of skipping the test
+        // if it is run on devices where TestNetworkStackServiceClient is not supported
+        return !useNetworkStackSignature()
+                && (mIsSignatureRequiredTest || !TestNetworkStackServiceClient.isSupported());
+    }
+
     @Before
     public void setUp() throws Exception {
+        final Method testMethod = IpClientIntegrationTestCommon.class.getMethod(
+                mTestNameRule.getMethodName());
+        mIsSignatureRequiredTest = testMethod.getAnnotation(SignatureRequiredTest.class) != null;
+        assumeFalse(testSkipped());
+
+        setUpTapInterface();
+        mCb = mock(IIpClientCallbacks.class);
+
+        if (useNetworkStackSignature()) {
+            setUpMocks();
+            setUpIpClient();
+        }
+
+        mIIpClient = makeIIpClient(mIfaceName, mCb);
+    }
+
+    protected void setUpMocks() throws Exception {
         MockitoAnnotations.initMocks(this);
 
         mDependencies = new Dependencies();
@@ -425,9 +516,6 @@ public class IpClientIntegrationTest {
         mDependencies.setDeviceConfigProperty(DhcpClient.ARP_PROBE_MAX_MS, 20);
         mDependencies.setDeviceConfigProperty(DhcpClient.ARP_FIRST_ANNOUNCE_DELAY_MS, 10);
         mDependencies.setDeviceConfigProperty(DhcpClient.ARP_ANNOUNCE_INTERVAL_MS, 10);
-
-        setUpTapInterface();
-        setUpIpClient();
     }
 
     private void awaitIpClientShutdown() throws Exception {
@@ -436,6 +524,7 @@ public class IpClientIntegrationTest {
 
     @After
     public void tearDown() throws Exception {
+        if (testSkipped()) return;
         if (mPacketReader != null) {
             mHandler.post(() -> mPacketReader.stop()); // Also closes the socket
             mTapFd = null;
@@ -443,11 +532,11 @@ public class IpClientIntegrationTest {
         if (mPacketReaderThread != null) {
             mPacketReaderThread.quitSafely();
         }
-        mIpc.shutdown();
+        mIIpClient.shutdown();
         awaitIpClientShutdown();
     }
 
-    private void setUpTapInterface() {
+    private void setUpTapInterface() throws Exception {
         final Instrumentation inst = InstrumentationRegistry.getInstrumentation();
         // Adopt the shell permission identity to create a test TAP interface.
         inst.getUiAutomation().adoptShellPermissionIdentity();
@@ -463,8 +552,9 @@ public class IpClientIntegrationTest {
             inst.getUiAutomation().dropShellPermissionIdentity();
         }
         mIfaceName = iface.getInterfaceName();
-        mClientMac = InterfaceParams.getByName(mIfaceName).macAddr.toByteArray();
-        mPacketReaderThread = new HandlerThread(IpClientIntegrationTest.class.getSimpleName());
+        mClientMac = getIfaceMacAddr(mIfaceName).toByteArray();
+        mPacketReaderThread = new HandlerThread(
+                IpClientIntegrationTestCommon.class.getSimpleName());
         mPacketReaderThread.start();
         mHandler = mPacketReaderThread.getThreadHandler();
 
@@ -477,6 +567,21 @@ public class IpClientIntegrationTest {
         mTapFd.setInt$(iface.getFileDescriptor().detachFd());
         mPacketReader = new TapPacketReader(mHandler, mTapFd, DATA_BUFFER_LEN);
         mHandler.post(() -> mPacketReader.start());
+    }
+
+    private MacAddress getIfaceMacAddr(String ifaceName) throws IOException {
+        // InterfaceParams.getByName requires CAP_NET_ADMIN: read the mac address with the shell
+        final String strMacAddr = getOneLineCommandOutput(
+                "su root cat /sys/class/net/" + ifaceName + "/address");
+        return MacAddress.fromString(strMacAddr);
+    }
+
+    private String getOneLineCommandOutput(String cmd) throws IOException {
+        try (ParcelFileDescriptor fd = InstrumentationRegistry.getInstrumentation()
+                .getUiAutomation().executeShellCommand(cmd);
+             BufferedReader reader = new BufferedReader(new FileReader(fd.getFileDescriptor()))) {
+            return reader.readLine();
+        }
     }
 
     private IpClient makeIpClient() throws Exception {
@@ -530,7 +635,8 @@ public class IpClientIntegrationTest {
         inOrder.verify(mAlarm, timeout(TEST_TIMEOUT_MS)).cancel(eq(listener));
     }
 
-    private OnAlarmListener expectAlarmSet(InOrder inOrder, String tagMatch, int afterSeconds) {
+    private OnAlarmListener expectAlarmSet(InOrder inOrder, String tagMatch, long afterSeconds,
+            Handler handler) {
         // Allow +/- 3 seconds to prevent flaky tests.
         final long when = SystemClock.elapsedRealtime() + afterSeconds * 1000;
         final long min = when - 3 * 1000;
@@ -538,8 +644,12 @@ public class IpClientIntegrationTest {
         ArgumentCaptor<OnAlarmListener> captor = ArgumentCaptor.forClass(OnAlarmListener.class);
         verifyWithTimeout(inOrder, mAlarm).setExact(
                 anyInt(), longThat(x -> x >= min && x <= max),
-                contains(tagMatch), captor.capture(), eq(mIpc.getHandler()));
+                contains(tagMatch), captor.capture(), eq(handler));
         return captor.getValue();
+    }
+
+    private OnAlarmListener expectAlarmSet(InOrder inOrder, String tagMatch, int afterSeconds) {
+        return expectAlarmSet(inOrder, tagMatch, (long) afterSeconds, mIpc.getHandler());
     }
 
     private boolean packetContainsExpectedField(final byte[] packet, final int offset,
@@ -585,20 +695,29 @@ public class IpClientIntegrationTest {
     }
 
     private static ByteBuffer buildDhcpOfferPacket(final DhcpPacket packet,
-            final Integer leaseTimeSec, final short mtu, final String captivePortalUrl) {
+            final Inet4Address clientAddress, final Integer leaseTimeSec, final short mtu,
+            final String captivePortalUrl, final Integer ipv6OnlyWaitTime) {
         return DhcpPacket.buildOfferPacket(DhcpPacket.ENCAP_L2, packet.getTransactionId(),
                 false /* broadcast */, SERVER_ADDR, INADDR_ANY /* relayIp */,
-                CLIENT_ADDR /* yourIp */, packet.getClientMac(), leaseTimeSec,
+                clientAddress /* yourIp */, packet.getClientMac(), leaseTimeSec,
                 NETMASK /* netMask */, BROADCAST_ADDR /* bcAddr */,
                 Collections.singletonList(SERVER_ADDR) /* gateways */,
                 Collections.singletonList(SERVER_ADDR) /* dnsServers */,
                 SERVER_ADDR /* dhcpServerIdentifier */, null /* domainName */, HOSTNAME,
-                false /* metered */, mtu, captivePortalUrl);
+                false /* metered */, mtu, captivePortalUrl, ipv6OnlyWaitTime);
+    }
+
+    private static ByteBuffer buildDhcpOfferPacket(final DhcpPacket packet,
+            final Inet4Address clientAddress, final Integer leaseTimeSec, final short mtu,
+            final String captivePortalUrl) {
+        return buildDhcpOfferPacket(packet, clientAddress, leaseTimeSec, mtu, captivePortalUrl,
+                null /* ipv6OnlyWaitTime */);
     }
 
     private static ByteBuffer buildDhcpAckPacket(final DhcpPacket packet,
             final Inet4Address clientAddress, final Integer leaseTimeSec, final short mtu,
-            final boolean rapidCommit, final String captivePortalApiUrl) {
+            final boolean rapidCommit, final String captivePortalApiUrl,
+            final Integer ipv6OnlyWaitTime) {
         return DhcpPacket.buildAckPacket(DhcpPacket.ENCAP_L2, packet.getTransactionId(),
                 false /* broadcast */, SERVER_ADDR, INADDR_ANY /* relayIp */,
                 clientAddress /* yourIp */, CLIENT_ADDR /* requestIp */, packet.getClientMac(),
@@ -606,7 +725,14 @@ public class IpClientIntegrationTest {
                 Collections.singletonList(SERVER_ADDR) /* gateways */,
                 Collections.singletonList(SERVER_ADDR) /* dnsServers */,
                 SERVER_ADDR /* dhcpServerIdentifier */, null /* domainName */, HOSTNAME,
-                false /* metered */, mtu, rapidCommit, captivePortalApiUrl);
+                false /* metered */, mtu, rapidCommit, captivePortalApiUrl, ipv6OnlyWaitTime);
+    }
+
+    private static ByteBuffer buildDhcpAckPacket(final DhcpPacket packet,
+            final Inet4Address clientAddress, final Integer leaseTimeSec, final short mtu,
+            final boolean rapidCommit, final String captivePortalApiUrl) {
+        return buildDhcpAckPacket(packet, clientAddress, leaseTimeSec, mtu, rapidCommit,
+                captivePortalApiUrl, null /* ipv6OnlyWaitTime */);
     }
 
     private static ByteBuffer buildDhcpNakPacket(final DhcpPacket packet) {
@@ -632,13 +758,12 @@ public class IpClientIntegrationTest {
     }
 
     private void startIpClientProvisioning(final ProvisioningConfiguration cfg) throws Exception {
-        mIpc.startProvisioning(cfg);
+        mIIpClient.startProvisioning(cfg.toStableParcelable());
     }
 
     private void startIpClientProvisioning(final boolean isDhcpLeaseCacheEnabled,
             final boolean shouldReplyRapidCommitAck, final boolean isPreconnectionEnabled,
             final boolean isDhcpIpConflictDetectEnabled,
-            final boolean isHostnameConfigurationEnabled, final String hostname,
             final String displayName, final ScanResultInfo scanResultInfo) throws Exception {
         ProvisioningConfiguration.Builder prov = new ProvisioningConfiguration.Builder()
                 .withoutIpReachabilityMonitor()
@@ -649,10 +774,9 @@ public class IpClientIntegrationTest {
         if (displayName != null) prov.withDisplayName(displayName);
         if (scanResultInfo != null) prov.withScanResultInfo(scanResultInfo);
 
-        mDependencies.setDhcpLeaseCacheEnabled(isDhcpLeaseCacheEnabled);
-        mDependencies.setDhcpRapidCommitEnabled(shouldReplyRapidCommitAck);
-        mDependencies.setDhcpIpConflictDetectEnabled(isDhcpIpConflictDetectEnabled);
-        mDependencies.setHostnameConfiguration(isHostnameConfigurationEnabled, hostname);
+        setDhcpFeatures(isDhcpLeaseCacheEnabled, shouldReplyRapidCommitAck,
+                isDhcpIpConflictDetectEnabled);
+
         startIpClientProvisioning(prov.build());
         if (!isPreconnectionEnabled) {
             verify(mCb, timeout(TEST_TIMEOUT_MS)).setFallbackMulticastFilter(false);
@@ -665,7 +789,6 @@ public class IpClientIntegrationTest {
             final boolean isDhcpIpConflictDetectEnabled)  throws Exception {
         startIpClientProvisioning(isDhcpLeaseCacheEnabled, isDhcpRapidCommitEnabled,
                 isPreconnectionEnabled, isDhcpIpConflictDetectEnabled,
-                false /* isHostnameConfigurationEnabled */, null /* hostname */,
                 null /* displayName */, null /* ScanResultInfo */);
     }
 
@@ -726,9 +849,10 @@ public class IpClientIntegrationTest {
             final boolean isHostnameConfigurationEnabled, final String hostname,
             final String captivePortalApiUrl, final String displayName,
             final ScanResultInfo scanResultInfo) throws Exception {
+        mDependencies.setHostnameConfiguration(isHostnameConfigurationEnabled, hostname);
         startIpClientProvisioning(isDhcpLeaseCacheEnabled, shouldReplyRapidCommitAck,
                 false /* isPreconnectionEnabled */, isDhcpIpConflictDetectEnabled,
-                isHostnameConfigurationEnabled, hostname, displayName, scanResultInfo);
+                displayName, scanResultInfo);
         return handleDhcpPackets(isSuccessLease, leaseTimeSec, shouldReplyRapidCommitAck, mtu,
                 captivePortalApiUrl);
     }
@@ -745,8 +869,8 @@ public class IpClientIntegrationTest {
                     mPacketReader.sendResponse(buildDhcpAckPacket(packet, CLIENT_ADDR, leaseTimeSec,
                               (short) mtu, true /* rapidCommit */, captivePortalApiUrl));
                 } else {
-                    mPacketReader.sendResponse(buildDhcpOfferPacket(packet, leaseTimeSec,
-                            (short) mtu, captivePortalApiUrl));
+                    mPacketReader.sendResponse(buildDhcpOfferPacket(packet, CLIENT_ADDR,
+                            leaseTimeSec, (short) mtu, captivePortalApiUrl));
                 }
             } else if (packet instanceof DhcpRequestPacket) {
                 final ByteBuffer byteBuffer = isSuccessLease
@@ -931,8 +1055,8 @@ public class IpClientIntegrationTest {
 
         final short mtu = (short) TEST_DEFAULT_MTU;
         if (!shouldReplyRapidCommitAck) {
-            mPacketReader.sendResponse(buildDhcpOfferPacket(packet, TEST_LEASE_DURATION_S, mtu,
-                    null /* captivePortalUrl */));
+            mPacketReader.sendResponse(buildDhcpOfferPacket(packet, CLIENT_ADDR,
+                    TEST_LEASE_DURATION_S, mtu, null /* captivePortalUrl */));
             packet = getNextDhcpPacket();
             assertTrue(packet instanceof DhcpRequestPacket);
         }
@@ -961,7 +1085,7 @@ public class IpClientIntegrationTest {
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
 
-    private ArpPacket getNextArpPacket(final int timeout) throws Exception {
+    private ArpPacket getNextArpPacket(final long timeout) throws Exception {
         byte[] packet;
         while ((packet = mArpPacketReadHead.getValue().poll(timeout, p -> true)) != null) {
             final ArpPacket arpPacket = parseArpPacketOrNull(packet);
@@ -1038,7 +1162,7 @@ public class IpClientIntegrationTest {
         }
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "InterfaceParams.getByName requires CAP_NET_ADMIN")
     public void testInterfaceParams() throws Exception {
         InterfaceParams params = InterfaceParams.getByName(mIfaceName);
         assertNotNull(params);
@@ -1065,7 +1189,7 @@ public class IpClientIntegrationTest {
         assertTrue(packet instanceof DhcpDiscoverPacket);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testHandleSuccessDhcpLease() throws Exception {
         final long currentTime = System.currentTimeMillis();
         performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
@@ -1075,7 +1199,7 @@ public class IpClientIntegrationTest {
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testHandleFailureDhcpLease() throws Exception {
         performDhcpHandshake(false /* isSuccessLease */, TEST_LEASE_DURATION_S,
                 true /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
@@ -1085,7 +1209,7 @@ public class IpClientIntegrationTest {
         assertIpMemoryNeverStoreNetworkAttributes();
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testHandleInfiniteLease() throws Exception {
         final long currentTime = System.currentTimeMillis();
         performDhcpHandshake(true /* isSuccessLease */, INFINITE_LEASE,
@@ -1095,7 +1219,7 @@ public class IpClientIntegrationTest {
         assertIpMemoryStoreNetworkAttributes(INFINITE_LEASE, currentTime, TEST_DEFAULT_MTU);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testHandleNoLease() throws Exception {
         final long currentTime = System.currentTimeMillis();
         performDhcpHandshake(true /* isSuccessLease */, null /* no lease time */,
@@ -1106,6 +1230,7 @@ public class IpClientIntegrationTest {
     }
 
     @Test @IgnoreAfter(Build.VERSION_CODES.Q) // INIT-REBOOT is enabled on R.
+    @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testHandleDisableInitRebootState() throws Exception {
         performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
                 false /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
@@ -1114,7 +1239,7 @@ public class IpClientIntegrationTest {
         assertIpMemoryNeverStoreNetworkAttributes();
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testHandleRapidCommitOption() throws Exception {
         final long currentTime = System.currentTimeMillis();
         performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
@@ -1124,7 +1249,7 @@ public class IpClientIntegrationTest {
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientStartWithCachedInfiniteLease() throws Exception {
         final DhcpPacket packet = getReplyFromDhcpLease(
                 new NetworkAttributes.Builder()
@@ -1137,7 +1262,7 @@ public class IpClientIntegrationTest {
         assertTrue(packet instanceof DhcpRequestPacket);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientStartWithCachedExpiredLease() throws Exception {
         final DhcpPacket packet = getReplyFromDhcpLease(
                  new NetworkAttributes.Builder()
@@ -1150,13 +1275,13 @@ public class IpClientIntegrationTest {
         assertTrue(packet instanceof DhcpDiscoverPacket);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientStartWithNullRetrieveNetworkAttributes() throws Exception {
         final DhcpPacket packet = getReplyFromDhcpLease(null /* na */, false /* timeout */);
         assertTrue(packet instanceof DhcpDiscoverPacket);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientStartWithTimeoutRetrieveNetworkAttributes() throws Exception {
         final DhcpPacket packet = getReplyFromDhcpLease(
                 new NetworkAttributes.Builder()
@@ -1169,7 +1294,7 @@ public class IpClientIntegrationTest {
         assertTrue(packet instanceof DhcpDiscoverPacket);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientStartWithCachedLeaseWithoutIPAddress() throws Exception {
         final DhcpPacket packet = getReplyFromDhcpLease(
                 new NetworkAttributes.Builder()
@@ -1180,7 +1305,7 @@ public class IpClientIntegrationTest {
         assertTrue(packet instanceof DhcpDiscoverPacket);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientRapidCommitEnabled() throws Exception {
         startIpClientProvisioning(true /* isDhcpLeaseCacheEnabled */,
                 true /* shouldReplyRapidCommitAck */, false /* isPreconnectionEnabled */,
@@ -1190,6 +1315,7 @@ public class IpClientIntegrationTest {
     }
 
     @Test @IgnoreUpTo(Build.VERSION_CODES.Q)
+    @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpServerInLinkProperties() throws Exception {
         assumeTrue(ConstantsShim.VERSION > Build.VERSION_CODES.Q);
 
@@ -1199,17 +1325,17 @@ public class IpClientIntegrationTest {
         assertEquals(SERVER_ADDR, captor.getValue().getDhcpServerAddress());
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testRestoreInitialInterfaceMtu() throws Exception {
         doRestoreInitialMtuTest(true /* shouldChangeMtu */, false /* shouldRemoveTapInterface */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testRestoreInitialInterfaceMtu_WithoutMtuChange() throws Exception {
         doRestoreInitialMtuTest(false /* shouldChangeMtu */, false /* shouldRemoveTapInterface */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testRestoreInitialInterfaceMtu_WithException() throws Exception {
         doThrow(new RemoteException("NetdNativeService::interfaceSetMtu")).when(mNetd)
                 .interfaceSetMtu(mIfaceName, TEST_DEFAULT_MTU);
@@ -1218,12 +1344,12 @@ public class IpClientIntegrationTest {
         assertEquals(NetworkInterface.getByName(mIfaceName).getMTU(), TEST_MIN_MTU);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testRestoreInitialInterfaceMtu_NotFoundInterfaceWhenStopping() throws Exception {
         doRestoreInitialMtuTest(true /* shouldChangeMtu */, true /* shouldRemoveTapInterface */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testRestoreInitialInterfaceMtu_NotFoundInterfaceWhenStartingProvisioning()
             throws Exception {
         removeTapInterface(mTapFd);
@@ -1237,7 +1363,7 @@ public class IpClientIntegrationTest {
         verify(mCb, never()).setNeighborDiscoveryOffload(true);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testRestoreInitialInterfaceMtu_stopIpClientAndRestart() throws Exception {
         long currentTime = System.currentTimeMillis();
 
@@ -1266,7 +1392,7 @@ public class IpClientIntegrationTest {
         assertEquals(NetworkInterface.getByName(mIfaceName).getMTU(), TEST_DEFAULT_MTU);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testRestoreInitialInterfaceMtu_removeInterfaceAndAddback() throws Exception {
         doAnswer(invocation -> {
             final LinkProperties lp = invocation.getArgument(0);
@@ -1508,7 +1634,7 @@ public class IpClientIntegrationTest {
         return lp;
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testRaRdnss() throws Exception {
         ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
                 .withoutIpReachabilityMonitor()
@@ -1570,8 +1696,8 @@ public class IpClientIntegrationTest {
 
     }
 
-    @Ignore  // AOSP kernels don't support the PREF64 option yet.
     @Test @IgnoreUpTo(Build.VERSION_CODES.Q)
+    @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testPref64Option() throws Exception {
         assumeTrue(ConstantsShim.VERSION > Build.VERSION_CODES.Q);
 
@@ -1749,7 +1875,7 @@ public class IpClientIntegrationTest {
         addIpAddressAndWaitForIt(mIfaceName);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testIpClientClearingIpAddressState() throws Exception {
         doIPv4OnlyProvisioningAndExitWithLeftAddress();
 
@@ -1770,7 +1896,7 @@ public class IpClientIntegrationTest {
         assertEquals("0.0.0.0", cfg.ipv4Addr);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testIpClientClearingIpAddressState_enablePreconnection() throws Exception {
         doIPv4OnlyProvisioningAndExitWithLeftAddress();
 
@@ -1786,42 +1912,42 @@ public class IpClientIntegrationTest {
         HandlerUtils.waitForIdle(mIpc.getHandler(), TEST_TIMEOUT_MS);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_success() throws Exception {
         doIpClientProvisioningWithPreconnectionTest(true /* shouldReplyRapidCommitAck */,
                 false /* shouldAbortPreconnection */, false /* shouldFirePreconnectionTimeout */,
                 false /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_SuccessWithoutRapidCommit() throws Exception {
         doIpClientProvisioningWithPreconnectionTest(false /* shouldReplyRapidCommitAck */,
                 false /* shouldAbortPreconnection */, false /* shouldFirePreconnectionTimeout */,
                 false /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_Abort() throws Exception {
         doIpClientProvisioningWithPreconnectionTest(true /* shouldReplyRapidCommitAck */,
                 true /* shouldAbortPreconnection */, false /* shouldFirePreconnectionTimeout */,
                 false /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_AbortWithoutRapiCommit() throws Exception {
         doIpClientProvisioningWithPreconnectionTest(false /* shouldReplyRapidCommitAck */,
                 true /* shouldAbortPreconnection */, false /* shouldFirePreconnectionTimeout */,
                 false /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_TimeoutBeforeAbort() throws Exception {
         doIpClientProvisioningWithPreconnectionTest(true /* shouldReplyRapidCommitAck */,
                 true /* shouldAbortPreconnection */, true /* shouldFirePreconnectionTimeout */,
                 true /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_TimeoutBeforeAbortWithoutRapidCommit()
             throws Exception {
         doIpClientProvisioningWithPreconnectionTest(false /* shouldReplyRapidCommitAck */,
@@ -1829,28 +1955,28 @@ public class IpClientIntegrationTest {
                 true /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_TimeoutafterAbort() throws Exception {
         doIpClientProvisioningWithPreconnectionTest(true /* shouldReplyRapidCommitAck */,
                 true /* shouldAbortPreconnection */, true /* shouldFirePreconnectionTimeout */,
                 false /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_TimeoutAfterAbortWithoutRapidCommit() throws Exception {
         doIpClientProvisioningWithPreconnectionTest(false /* shouldReplyRapidCommitAck */,
                 true /* shouldAbortPreconnection */, true /* shouldFirePreconnectionTimeout */,
                 false /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_TimeoutBeforeSuccess() throws Exception {
         doIpClientProvisioningWithPreconnectionTest(true /* shouldReplyRapidCommitAck */,
                 false /* shouldAbortPreconnection */, true /* shouldFirePreconnectionTimeout */,
                 true /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_TimeoutBeforeSuccessWithoutRapidCommit()
             throws Exception {
         doIpClientProvisioningWithPreconnectionTest(false /* shouldReplyRapidCommitAck */,
@@ -1858,14 +1984,14 @@ public class IpClientIntegrationTest {
                 true /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_TimeoutAfterSuccess() throws Exception {
         doIpClientProvisioningWithPreconnectionTest(true /* shouldReplyRapidCommitAck */,
                 false /* shouldAbortPreconnection */, true /* shouldFirePreconnectionTimeout */,
                 false /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_TimeoutAfterSuccessWithoutRapidCommit()
             throws Exception {
         doIpClientProvisioningWithPreconnectionTest(false /* shouldReplyRapidCommitAck */,
@@ -1873,7 +1999,7 @@ public class IpClientIntegrationTest {
                 false /* timeoutBeforePreconnectionComplete */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientPreconnection_WithoutLayer2InfoWhenStartingProv() throws Exception {
         // For FILS connection, current bssid (also l2key and cluster) is still null when
         // starting provisioning since the L2 link hasn't been established yet. Ensure that
@@ -1895,63 +2021,63 @@ public class IpClientIntegrationTest {
         verify(mCb, timeout(TEST_TIMEOUT_MS)).setFallbackMulticastFilter(false);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpDecline_conflictByArpReply() throws Exception {
         doIpAddressConflictDetectionTest(true /* causeIpAddressConflict */,
                 false /* shouldReplyRapidCommitAck */, true /* isDhcpIpConflictDetectEnabled */,
                 true /* shouldResponseArpReply */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpDecline_conflictByArpProbe() throws Exception {
         doIpAddressConflictDetectionTest(true /* causeIpAddressConflict */,
                 false /* shouldReplyRapidCommitAck */, true /* isDhcpIpConflictDetectEnabled */,
                 false /* shouldResponseArpReply */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpDecline_EnableFlagWithoutIpConflict() throws Exception {
         doIpAddressConflictDetectionTest(false /* causeIpAddressConflict */,
                 false /* shouldReplyRapidCommitAck */, true /* isDhcpIpConflictDetectEnabled */,
                 false /* shouldResponseArpReply */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpDecline_WithoutIpConflict() throws Exception {
         doIpAddressConflictDetectionTest(false /* causeIpAddressConflict */,
                 false /* shouldReplyRapidCommitAck */, false /* isDhcpIpConflictDetectEnabled */,
                 false /* shouldResponseArpReply */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpDecline_WithRapidCommitWithoutIpConflict() throws Exception {
         doIpAddressConflictDetectionTest(false /* causeIpAddressConflict */,
                 true /* shouldReplyRapidCommitAck */, false /* isDhcpIpConflictDetectEnabled */,
                 false /* shouldResponseArpReply */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpDecline_WithRapidCommitConflictByArpReply() throws Exception {
         doIpAddressConflictDetectionTest(true /* causeIpAddressConflict */,
                 true /* shouldReplyRapidCommitAck */, true /* isDhcpIpConflictDetectEnabled */,
                 true /* shouldResponseArpReply */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpDecline_WithRapidCommitConflictByArpProbe() throws Exception {
         doIpAddressConflictDetectionTest(true /* causeIpAddressConflict */,
                 true /* shouldReplyRapidCommitAck */, true /* isDhcpIpConflictDetectEnabled */,
                 false /* shouldResponseArpReply */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpDecline_EnableFlagWithRapidCommitWithoutIpConflict() throws Exception {
         doIpAddressConflictDetectionTest(false /* causeIpAddressConflict */,
                 true /* shouldReplyRapidCommitAck */, true /* isDhcpIpConflictDetectEnabled */,
                 false /* shouldResponseArpReply */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testHostname_enableConfig() throws Exception {
         final long currentTime = System.currentTimeMillis();
         final List<DhcpPacket> sentPackets = performDhcpHandshake(true /* isSuccessLease */,
@@ -1966,7 +2092,7 @@ public class IpClientIntegrationTest {
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testHostname_disableConfig() throws Exception {
         final long currentTime = System.currentTimeMillis();
         final List<DhcpPacket> sentPackets = performDhcpHandshake(true /* isSuccessLease */,
@@ -1981,7 +2107,7 @@ public class IpClientIntegrationTest {
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testHostname_enableConfigWithNullHostname() throws Exception {
         final long currentTime = System.currentTimeMillis();
         final List<DhcpPacket> sentPackets = performDhcpHandshake(true /* isSuccessLease */,
@@ -2008,42 +2134,43 @@ public class IpClientIntegrationTest {
 
         // Send Offer and handle Request -> Ack
         final String serverSentUrl = serverSendsOption ? TEST_CAPTIVE_PORTAL_URL : null;
-        mPacketReader.sendResponse(buildDhcpOfferPacket(discover, TEST_LEASE_DURATION_S,
-                (short) TEST_DEFAULT_MTU, serverSentUrl));
+        mPacketReader.sendResponse(buildDhcpOfferPacket(discover, CLIENT_ADDR,
+                TEST_LEASE_DURATION_S, (short) TEST_DEFAULT_MTU, serverSentUrl));
         final int testMtu = 1345;
         handleDhcpPackets(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
                 false /* shouldReplyRapidCommitAck */, testMtu, serverSentUrl);
 
         final Uri expectedUrl = featureEnabled && serverSendsOption
                 ? Uri.parse(TEST_CAPTIVE_PORTAL_URL) : null;
-        // Wait for LinkProperties containing DHCP-obtained info, such as MTU
+        // LinkProperties will be updated multiple times. Wait for it to contain DHCP-obtained info,
+        // such as MTU.
         final ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
-        verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(
+        verify(mCb, timeout(TEST_TIMEOUT_MS).atLeastOnce()).onLinkPropertiesChange(
                 argThat(lp -> lp.getMtu() == testMtu));
 
         // Ensure that the URL was set as expected in the callbacks.
         // Can't verify the URL up to Q as there is no such attribute in LinkProperties.
         if (!ShimUtils.isAtLeastR()) return;
-        verify(mCb).onLinkPropertiesChange(captor.capture());
+        verify(mCb, atLeastOnce()).onLinkPropertiesChange(captor.capture());
         assertTrue(captor.getAllValues().stream().anyMatch(
                 lp -> Objects.equals(expectedUrl, lp.getCaptivePortalApiUrl())));
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientCaptivePortalApiEnabled() throws Exception {
         // Only run the test on platforms / builds where the API is enabled
         assumeTrue(CaptivePortalDataShimImpl.isSupported());
         runDhcpClientCaptivePortalApiTest(true /* featureEnabled */, true /* serverSendsOption */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientCaptivePortalApiEnabled_NoUrl() throws Exception {
         // Only run the test on platforms / builds where the API is enabled
         assumeTrue(CaptivePortalDataShimImpl.isSupported());
         runDhcpClientCaptivePortalApiTest(true /* featureEnabled */, false /* serverSendsOption */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpClientCaptivePortalApiDisabled() throws Exception {
         // Only run the test on platforms / builds where the API is disabled
         assumeFalse(CaptivePortalDataShimImpl.isSupported());
@@ -2104,7 +2231,7 @@ public class IpClientIntegrationTest {
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testUpstreamHotspotDetection() throws Exception {
         byte[] data = new byte[10];
         new Random().nextBytes(data);
@@ -2113,7 +2240,7 @@ public class IpClientIntegrationTest {
                 true /* expectMetered */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testUpstreamHotspotDetection_incorrectIeId() throws Exception {
         byte[] data = new byte[10];
         new Random().nextBytes(data);
@@ -2122,7 +2249,7 @@ public class IpClientIntegrationTest {
                 false /* expectMetered */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testUpstreamHotspotDetection_incorrectOUI() throws Exception {
         byte[] data = new byte[10];
         new Random().nextBytes(data);
@@ -2131,7 +2258,7 @@ public class IpClientIntegrationTest {
                 false /* expectMetered */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testUpstreamHotspotDetection_incorrectSsid() throws Exception {
         byte[] data = new byte[10];
         new Random().nextBytes(data);
@@ -2140,7 +2267,7 @@ public class IpClientIntegrationTest {
                 false /* expectMetered */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testUpstreamHotspotDetection_incorrectType() throws Exception {
         byte[] data = new byte[10];
         new Random().nextBytes(data);
@@ -2149,7 +2276,7 @@ public class IpClientIntegrationTest {
                 false /* expectMetered */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testUpstreamHotspotDetection_zeroLengthData() throws Exception {
         byte[] data = new byte[0];
         doUpstreamHotspotDetectionTest(0xdd, "\"ssid\"", "ssid",
@@ -2223,37 +2350,37 @@ public class IpClientIntegrationTest {
         }
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpRoaming() throws Exception {
         doDhcpRoamingTest(false /* hasMismatchedIpAddress */, "\"0001docomo\"" /* display name */,
                 TEST_DHCP_ROAM_SSID, TEST_DEFAULT_BSSID, true /* expectRoaming */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpRoaming_invalidBssid() throws Exception {
         doDhcpRoamingTest(false /* hasMismatchedIpAddress */, "\"0001docomo\"" /* display name */,
                 TEST_DHCP_ROAM_SSID, TEST_DHCP_ROAM_BSSID, false /* expectRoaming */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpRoaming_nullScanResultInfo() throws Exception {
         doDhcpRoamingTest(false /* hasMismatchedIpAddress */, "\"0001docomo\"" /* display name */,
                 null /* SSID */, null /* BSSID */, false /* expectRoaming */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpRoaming_invalidSsid() throws Exception {
         doDhcpRoamingTest(false /* hasMismatchedIpAddress */, "\"0001docomo\"" /* display name */,
                 TEST_DEFAULT_SSID, TEST_DEFAULT_BSSID, false /* expectRoaming */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpRoaming_invalidDisplayName() throws Exception {
         doDhcpRoamingTest(false /* hasMismatchedIpAddress */, "\"test-ssid\"" /* display name */,
                 TEST_DHCP_ROAM_SSID, TEST_DEFAULT_BSSID, false /* expectRoaming */);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDhcpRoaming_mismatchedLeasedIpAddress() throws Exception {
         doDhcpRoamingTest(true /* hasMismatchedIpAddress */, "\"0001docomo\"" /* display name */,
                 TEST_DHCP_ROAM_SSID, TEST_DEFAULT_BSSID, true /* expectRoaming */);
@@ -2295,7 +2422,7 @@ public class IpClientIntegrationTest {
         reset(mCb);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testIgnoreIpv6ProvisioningLoss() throws Exception {
         doDualStackProvisioning();
 
@@ -2321,10 +2448,210 @@ public class IpClientIntegrationTest {
         assertEquals(lp.getDnsServers().get(0), SERVER_ADDR);
     }
 
-    @Test
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
     public void testDualStackProvisioning() throws Exception {
         doDualStackProvisioning();
 
         verify(mCb, never()).onProvisioningFailure(any());
+    }
+
+    private DhcpPacket verifyDhcpPacketRequestsIPv6OnlyPreferredOption(
+            Class<? extends DhcpPacket> packetType) throws Exception {
+        final DhcpPacket packet = getNextDhcpPacket();
+        assertTrue(packetType.isInstance(packet));
+        assertTrue(packet.hasRequestedParam(DHCP_IPV6_ONLY_PREFERRED));
+        return packet;
+    }
+
+    private void doIPv6OnlyPreferredOptionTest(final Integer ipv6OnlyWaitTime,
+            final Inet4Address clientAddress) throws Exception {
+        final ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
+                .withoutIpReachabilityMonitor()
+                .build();
+        mDependencies.setIPv6OnlyPreferredEnabled(true);
+        mIpc.startProvisioning(config);
+
+        final DhcpPacket packet =
+                verifyDhcpPacketRequestsIPv6OnlyPreferredOption(DhcpDiscoverPacket.class);
+
+        // Respond DHCPOFFER with IPv6-Only preferred option and offered address.
+        mPacketReader.sendResponse(buildDhcpOfferPacket(packet, clientAddress,
+                TEST_LEASE_DURATION_S, (short) TEST_DEFAULT_MTU, null /* captivePortalUrl */,
+                ipv6OnlyWaitTime));
+    }
+
+    private void doDiscoverIPv6OnlyPreferredOptionTest(final int optionSecs,
+            final long expectedWaitSecs) throws Exception {
+        doIPv6OnlyPreferredOptionTest(optionSecs, CLIENT_ADDR);
+        final OnAlarmListener alarm = expectAlarmSet(null /* inOrder */, "TIMEOUT",
+                expectedWaitSecs, mDependencies.mDhcpClient.getHandler());
+        mDependencies.mDhcpClient.getHandler().post(() -> alarm.onAlarm());
+        // Implicitly check that the client never sent a DHCPREQUEST to request the offered address.
+        verifyDhcpPacketRequestsIPv6OnlyPreferredOption(DhcpDiscoverPacket.class);
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testDiscoverIPv6OnlyPreferredOption() throws Exception {
+        doDiscoverIPv6OnlyPreferredOptionTest(TEST_IPV6_ONLY_WAIT_S, TEST_IPV6_ONLY_WAIT_S);
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testDiscoverIPv6OnlyPreferredOption_LowerIPv6OnlyWait() throws Exception {
+        doDiscoverIPv6OnlyPreferredOptionTest(TEST_LOWER_IPV6_ONLY_WAIT_S,
+                TEST_LOWER_IPV6_ONLY_WAIT_S);
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testDiscoverIPv6OnlyPreferredOption_ZeroIPv6OnlyWait() throws Exception {
+        doDiscoverIPv6OnlyPreferredOptionTest(TEST_ZERO_IPV6_ONLY_WAIT_S,
+                TEST_LOWER_IPV6_ONLY_WAIT_S);
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testDiscoverIPv6OnlyPreferredOption_MaxIPv6OnlyWait() throws Exception {
+        doDiscoverIPv6OnlyPreferredOptionTest((int) TEST_MAX_IPV6_ONLY_WAIT_S, 0xffffffffL);
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testDiscoverIPv6OnlyPreferredOption_ZeroIPv6OnlyWaitWithOfferedAnyAddress()
+            throws Exception {
+        doIPv6OnlyPreferredOptionTest(TEST_ZERO_IPV6_ONLY_WAIT_S, IPV4_ADDR_ANY);
+
+        final OnAlarmListener alarm = expectAlarmSet(null /* inOrder */, "TIMEOUT", 300,
+                mDependencies.mDhcpClient.getHandler());
+        mDependencies.mDhcpClient.getHandler().post(() -> alarm.onAlarm());
+
+        verifyDhcpPacketRequestsIPv6OnlyPreferredOption(DhcpDiscoverPacket.class);
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testDiscoverIPv6OnlyPreferredOption_enabledPreconnection() throws Exception {
+        final ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
+                .withoutIpReachabilityMonitor()
+                .withPreconnection()
+                .build();
+
+        mDependencies.setDhcpRapidCommitEnabled(true);
+        mDependencies.setIPv6OnlyPreferredEnabled(true);
+        mIpc.startProvisioning(config);
+
+        final DhcpPacket packet = assertDiscoverPacketOnPreconnectionStart();
+        verify(mCb).setNeighborDiscoveryOffload(true);
+
+        // Force IpClient transition to RunningState from PreconnectionState.
+        mIpc.notifyPreconnectionComplete(true /* success */);
+        HandlerUtils.waitForIdle(mDependencies.mDhcpClient.getHandler(), TEST_TIMEOUT_MS);
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).setFallbackMulticastFilter(false);
+
+        // DHCP server SHOULD NOT honor the Rapid-Commit option if the response would
+        // contain the IPv6-only Preferred option to the client, instead respond with
+        // a DHCPOFFER.
+        mPacketReader.sendResponse(buildDhcpOfferPacket(packet, CLIENT_ADDR, TEST_LEASE_DURATION_S,
+                (short) TEST_DEFAULT_MTU, null /* captivePortalUrl */, TEST_IPV6_ONLY_WAIT_S));
+
+        final OnAlarmListener alarm = expectAlarmSet(null /* inOrder */, "TIMEOUT", 1800,
+                mDependencies.mDhcpClient.getHandler());
+        mDependencies.mDhcpClient.getHandler().post(() -> alarm.onAlarm());
+
+        verifyDhcpPacketRequestsIPv6OnlyPreferredOption(DhcpDiscoverPacket.class);
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testDiscoverIPv6OnlyPreferredOption_NoIPv6OnlyPreferredOption() throws Exception {
+        doIPv6OnlyPreferredOptionTest(null /* ipv6OnlyWaitTime */, CLIENT_ADDR);
+
+        // The IPv6-only Preferred option SHOULD be included in the Parameter Request List option
+        // in DHCPREQUEST messages after receiving a DHCPOFFER without this option.
+        verifyDhcpPacketRequestsIPv6OnlyPreferredOption(DhcpRequestPacket.class);
+    }
+
+    private void startFromInitRebootStateWithIPv6OnlyPreferredOption(final Integer ipv6OnlyWaitTime,
+            final long expectedWaitSecs) throws Exception {
+        doAnswer(invocation -> {
+            ((OnNetworkAttributesRetrievedListener) invocation.getArgument(1))
+                    .onNetworkAttributesRetrieved(new Status(SUCCESS), TEST_L2KEY,
+                            new NetworkAttributes.Builder()
+                                .setAssignedV4Address(CLIENT_ADDR)
+                                .setAssignedV4AddressExpiry(Long.MAX_VALUE) // lease is always valid
+                                .setMtu(new Integer(TEST_DEFAULT_MTU))
+                                .setCluster(TEST_CLUSTER)
+                                .setDnsAddresses(Collections.singletonList(SERVER_ADDR))
+                                .build());
+            return null;
+        }).when(mIpMemoryStore).retrieveNetworkAttributes(eq(TEST_L2KEY), any());
+
+        final ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
+                .withoutIpReachabilityMonitor()
+                .withLayer2Information(new Layer2Information(TEST_L2KEY, TEST_CLUSTER,
+                          MacAddress.fromString(TEST_DEFAULT_BSSID)))
+                .build();
+
+        mDependencies.setDhcpLeaseCacheEnabled(true);
+        mDependencies.setIPv6OnlyPreferredEnabled(true);
+        mIpc.startProvisioning(config);
+
+        final DhcpPacket packet =
+                verifyDhcpPacketRequestsIPv6OnlyPreferredOption(DhcpRequestPacket.class);
+
+        // Respond DHCPACK with IPv6-Only preferred option.
+        mPacketReader.sendResponse(buildDhcpAckPacket(packet, CLIENT_ADDR,
+                TEST_LEASE_DURATION_S, (short) TEST_DEFAULT_MTU, false /* rapidcommit */,
+                null /* captivePortalUrl */, ipv6OnlyWaitTime));
+
+        if (ipv6OnlyWaitTime != null) {
+            expectAlarmSet(null /* inOrder */, "TIMEOUT", expectedWaitSecs,
+                    mDependencies.mDhcpClient.getHandler());
+        }
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testRequestIPv6OnlyPreferredOption() throws Exception {
+        startFromInitRebootStateWithIPv6OnlyPreferredOption(TEST_IPV6_ONLY_WAIT_S,
+                TEST_IPV6_ONLY_WAIT_S);
+
+        // Client transits to IPv6OnlyPreferredState from INIT-REBOOT state when receiving valid
+        // IPv6-Only preferred option(default value) in the DHCPACK packet.
+        assertIpMemoryNeverStoreNetworkAttributes();
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testRequestIPv6OnlyPreferredOption_LowerIPv6OnlyWait() throws Exception {
+        startFromInitRebootStateWithIPv6OnlyPreferredOption(TEST_LOWER_IPV6_ONLY_WAIT_S,
+                TEST_LOWER_IPV6_ONLY_WAIT_S);
+
+        // Client transits to IPv6OnlyPreferredState from INIT-REBOOT state when receiving valid
+        // IPv6-Only preferred option(less than MIN_V6ONLY_WAIT_MS) in the DHCPACK packet.
+        assertIpMemoryNeverStoreNetworkAttributes();
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testRequestIPv6OnlyPreferredOption_ZeroIPv6OnlyWait() throws Exception {
+        startFromInitRebootStateWithIPv6OnlyPreferredOption(TEST_ZERO_IPV6_ONLY_WAIT_S,
+                TEST_LOWER_IPV6_ONLY_WAIT_S);
+
+        // Client transits to IPv6OnlyPreferredState from INIT-REBOOT state when receiving valid
+        // IPv6-Only preferred option(0) in the DHCPACK packet.
+        assertIpMemoryNeverStoreNetworkAttributes();
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testRequestIPv6OnlyPreferredOption_MaxIPv6OnlyWait() throws Exception {
+        startFromInitRebootStateWithIPv6OnlyPreferredOption((int) TEST_MAX_IPV6_ONLY_WAIT_S,
+                0xffffffffL);
+
+        // Client transits to IPv6OnlyPreferredState from INIT-REBOOT state when receiving valid
+        // IPv6-Only preferred option(MAX_UNSIGNED_INTEGER: 0xFFFFFFFF) in the DHCPACK packet.
+        assertIpMemoryNeverStoreNetworkAttributes();
+    }
+
+    @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
+    public void testRequestIPv6OnlyPreferredOption_NoIPv6OnlyPreferredOption() throws Exception {
+        final long currentTime = System.currentTimeMillis();
+        startFromInitRebootStateWithIPv6OnlyPreferredOption(null /* ipv6OnlyWaitTime */,
+                0 /* expectedWaitSecs */);
+
+        // Client processes DHCPACK packet normally and transits to the ConfiguringInterfaceState
+        // due to the null V6ONLY_WAIT.
+        assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
 }
