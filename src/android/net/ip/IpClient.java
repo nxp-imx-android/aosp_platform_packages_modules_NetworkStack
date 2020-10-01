@@ -777,6 +777,7 @@ public class IpClient extends StateMachine {
 
     private void stopStateMachineUpdaters() {
         mObserverRegistry.unregisterObserver(mLinkObserver);
+        mLinkObserver.shutdown();
     }
 
     @Override
@@ -1582,7 +1583,11 @@ public class IpClient extends StateMachine {
             return;
         }
 
-        if (params.index != mInterfaceParams.index) {
+        // Check whether "mInterfaceParams" is null or not to prevent the potential NPE
+        // introduced if the interface was initially not found, but came back before this
+        // method was called. See b/162808916 for more details. TODO: query the new interface
+        // parameters by the interface index instead and check that the index has not changed.
+        if (mInterfaceParams == null || params.index != mInterfaceParams.index) {
             Log.w(mTag, "interface: " + mInterfaceName + " has a different index: " + params.index);
             return;
         }
@@ -1601,8 +1606,16 @@ public class IpClient extends StateMachine {
         mL2Key = info.l2Key;
         mCluster = info.cluster;
 
+        // Sometimes the wifi code passes in a null BSSID. Don't use Log.wtf in R because
+        // it's a known bug that will not be fixed in R.
         if (info.bssid == null || mCurrentBssid == null) {
-            Log.wtf(mTag, "bssid in the parcelable or current tracked bssid should be non-null");
+            final String msg = "bssid in the parcelable: " + info.bssid + " or "
+                    + "current tracked bssid: " + mCurrentBssid + " is null";
+            if (ShimUtils.isAtLeastS()) {
+                Log.wtf(mTag, msg);
+            } else {
+                Log.w(mTag, msg);
+            }
             return;
         }
 
@@ -2156,7 +2169,8 @@ public class IpClient extends StateMachine {
                 //     a) initial address acquisition succeeds,
                 //     b) renew succeeds or is NAK'd,
                 //     c) rebind succeeds or is NAK'd, or
-                //     c) the lease expires,
+                //     d) the lease expires, or
+                //     e) the IPv6-only preferred option is enabled and entering Ipv6OnlyWaitState.
                 //
                 // but never when initial address acquisition fails. The latter
                 // condition is now governed by the provisioning timeout.
@@ -2169,6 +2183,8 @@ public class IpClient extends StateMachine {
                             break;
                         case DhcpClient.DHCP_FAILURE:
                             handleIPv4Failure();
+                            break;
+                        case DhcpClient.DHCP_IPV6_ONLY:
                             break;
                         default:
                             logError("Unknown CMD_POST_DHCP_ACTION status: %s", msg.arg1);
