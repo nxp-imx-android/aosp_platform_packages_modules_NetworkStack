@@ -145,6 +145,7 @@ filegroup {
         "//packages/modules/NetworkStack/tests/unit",
         "//packages/modules/NetworkStack/tests/integration",
         "//frameworks/base/packages/Tethering/tests/integration",
+        "//packages/modules/Connectivity/Tethering/tests/integration",
     ]
 }
 
@@ -220,6 +221,7 @@ android_library {
     visibility: [
         "//frameworks/base/tests/net/integration",
         "//cts/tests/tests/net",
+        "//packages/modules/Connectivity/tests/cts/net",
     ],
 }
 
