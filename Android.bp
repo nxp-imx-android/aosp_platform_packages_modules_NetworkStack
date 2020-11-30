@@ -43,6 +43,7 @@
 // Common defaults to define SDK level
 java_defaults {
     name: "NetworkStackDevApiLevel",
+    min_sdk_version: "29",
     sdk_version: "system_current",
 }
 
@@ -145,6 +146,7 @@ filegroup {
         "//packages/modules/NetworkStack/tests/unit",
         "//packages/modules/NetworkStack/tests/integration",
         "//frameworks/base/packages/Tethering/tests/integration",
+        "//packages/modules/Connectivity/Tethering/tests/integration",
     ]
 }
 
@@ -220,6 +222,7 @@ android_library {
     visibility: [
         "//frameworks/base/tests/net/integration",
         "//cts/tests/tests/net",
+        "//packages/modules/Connectivity/tests/cts/net",
     ],
 }
 

@@ -51,11 +51,11 @@ import static android.system.OsConstants.SO_BROADCAST;
 import static android.system.OsConstants.SO_RCVBUF;
 import static android.system.OsConstants.SO_REUSEADDR;
 
-import static com.android.server.util.NetworkStackConstants.ARP_REQUEST;
-import static com.android.server.util.NetworkStackConstants.ETHER_ADDR_LEN;
-import static com.android.server.util.NetworkStackConstants.IPV4_ADDR_ANY;
-import static com.android.server.util.NetworkStackConstants.IPV4_CONFLICT_ANNOUNCE_NUM;
-import static com.android.server.util.NetworkStackConstants.IPV4_CONFLICT_PROBE_NUM;
+import static com.android.net.module.util.NetworkStackConstants.ARP_REQUEST;
+import static com.android.net.module.util.NetworkStackConstants.ETHER_ADDR_LEN;
+import static com.android.net.module.util.NetworkStackConstants.IPV4_ADDR_ANY;
+import static com.android.net.module.util.NetworkStackConstants.IPV4_CONFLICT_ANNOUNCE_NUM;
+import static com.android.net.module.util.NetworkStackConstants.IPV4_CONFLICT_PROBE_NUM;
 
 import android.content.Context;
 import android.net.DhcpResults;
@@ -561,10 +561,13 @@ public class DhcpClient extends StateMachine {
 
     /**
      * check whether or not to support IPv6-only preferred option.
+     *
+     * IPv6-only preferred option is enabled by default if there is no experiment flag set to
+     * disable this feature explicitly.
      */
     public boolean isIPv6OnlyPreferredModeEnabled() {
         return mDependencies.isFeatureEnabled(mContext, DHCP_IPV6_ONLY_PREFERRED_VERSION,
-                false /* defaultEnabled */);
+                true /* defaultEnabled */);
     }
 
     private void recordMetricEnabledFeatures() {
