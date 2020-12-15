@@ -43,6 +43,7 @@
 // Common defaults to define SDK level
 java_defaults {
     name: "NetworkStackDevApiLevel",
+    min_sdk_version: "29",
     sdk_version: "system_current",
 }
 
@@ -198,6 +199,7 @@ android_app {
     manifest: "AndroidManifest_Next.xml",
     // The permission configuration *must* be included to ensure security of the device
     required: ["NetworkPermissionConfig"],
+    enabled: false, // Disabled in mainline-prod
 }
 
 // Updatable network stack for finalized API
@@ -235,6 +237,9 @@ cc_library_shared {
     shared_libs: [
         "liblog",
         "libnativehelper_compat_libc++",
+    ],
+    static_libs: [
+        "libnetjniutils",
     ],
 
     // We cannot use plain "libc++" here to link libc++ dynamically because it results in:
