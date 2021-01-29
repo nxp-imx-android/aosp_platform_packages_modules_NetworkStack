@@ -51,11 +51,11 @@ import static android.system.OsConstants.SO_BROADCAST;
 import static android.system.OsConstants.SO_RCVBUF;
 import static android.system.OsConstants.SO_REUSEADDR;
 
-import static com.android.server.util.NetworkStackConstants.ARP_REQUEST;
-import static com.android.server.util.NetworkStackConstants.ETHER_ADDR_LEN;
-import static com.android.server.util.NetworkStackConstants.IPV4_ADDR_ANY;
-import static com.android.server.util.NetworkStackConstants.IPV4_CONFLICT_ANNOUNCE_NUM;
-import static com.android.server.util.NetworkStackConstants.IPV4_CONFLICT_PROBE_NUM;
+import static com.android.net.module.util.NetworkStackConstants.ARP_REQUEST;
+import static com.android.net.module.util.NetworkStackConstants.ETHER_ADDR_LEN;
+import static com.android.net.module.util.NetworkStackConstants.IPV4_ADDR_ANY;
+import static com.android.net.module.util.NetworkStackConstants.IPV4_CONFLICT_ANNOUNCE_NUM;
+import static com.android.net.module.util.NetworkStackConstants.IPV4_CONFLICT_PROBE_NUM;
 
 import android.content.Context;
 import android.net.DhcpResults;
@@ -71,10 +71,10 @@ import android.net.ipmemorystore.OnStatusListener;
 import android.net.metrics.DhcpClientEvent;
 import android.net.metrics.DhcpErrorEvent;
 import android.net.metrics.IpConnectivityLog;
+import android.net.networkstack.aidl.dhcp.DhcpOption;
 import android.net.util.HostnameTransliterator;
 import android.net.util.InterfaceParams;
 import android.net.util.NetworkStackUtils;
-import android.net.util.PacketReader;
 import android.net.util.SocketUtils;
 import android.os.Build;
 import android.os.Handler;
@@ -99,6 +99,8 @@ import com.android.internal.util.State;
 import com.android.internal.util.StateMachine;
 import com.android.internal.util.TrafficStatsConstants;
 import com.android.internal.util.WakeupMessage;
+import com.android.net.module.util.DeviceConfigUtils;
+import com.android.net.module.util.PacketReader;
 import com.android.networkstack.R;
 import com.android.networkstack.apishim.CaptivePortalDataShimImpl;
 import com.android.networkstack.apishim.SocketUtilsShimImpl;
@@ -114,6 +116,7 @@ import java.net.SocketAddress;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Random;
 
 /**
@@ -302,6 +305,10 @@ public class DhcpClient extends StateMachine {
         if (isIPv6OnlyPreferredModeEnabled()) {
             params.write(DHCP_IPV6_ONLY_PREFERRED);
         }
+        // Customized DHCP options to be put in PRL.
+        for (DhcpOption option : mConfiguration.options) {
+            if (option.value == null) params.write(option.type);
+        }
         return params.toByteArray();
     }
 
@@ -435,11 +442,11 @@ public class DhcpClient extends StateMachine {
 
         /**
          * Return whether a feature guarded by a feature flag is enabled.
-         * @see NetworkStackUtils#isFeatureEnabled(Context, String, String)
+         * @see DeviceConfigUtils#isFeatureEnabled(Context, String, String)
          */
         public boolean isFeatureEnabled(final Context context, final String name,
                 boolean defaultEnabled) {
-            return NetworkStackUtils.isFeatureEnabled(context, NAMESPACE_CONNECTIVITY, name,
+            return DeviceConfigUtils.isFeatureEnabled(context, NAMESPACE_CONNECTIVITY, name,
                     defaultEnabled);
         }
 
@@ -448,7 +455,7 @@ public class DhcpClient extends StateMachine {
          */
         public int getIntDeviceConfig(final String name, int minimumValue, int maximumValue,
                 int defaultValue) {
-            return NetworkStackUtils.getDeviceConfigPropertyInt(NAMESPACE_CONNECTIVITY,
+            return DeviceConfigUtils.getDeviceConfigPropertyInt(NAMESPACE_CONNECTIVITY,
                     name, minimumValue, maximumValue, defaultValue);
         }
 
@@ -562,14 +569,12 @@ public class DhcpClient extends StateMachine {
     /**
      * check whether or not to support IPv6-only preferred option.
      *
-     * IPv6-only preferred option is supported on Android S by default if there is no experiment
-     * flag set to disable this feature explicitly.
+     * IPv6-only preferred option is enabled by default if there is no experiment flag set to
+     * disable this feature explicitly.
      */
     public boolean isIPv6OnlyPreferredModeEnabled() {
-        final boolean defaultEnabled =
-                ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.R);
         return mDependencies.isFeatureEnabled(mContext, DHCP_IPV6_ONLY_PREFERRED_VERSION,
-                defaultEnabled);
+                true /* defaultEnabled */);
     }
 
     private void recordMetricEnabledFeatures() {
@@ -744,7 +749,8 @@ public class DhcpClient extends StateMachine {
     private boolean sendDiscoverPacket() {
         final ByteBuffer packet = DhcpPacket.buildDiscoverPacket(
                 DhcpPacket.ENCAP_L2, mTransactionId, getSecs(), mHwAddr,
-                DO_UNICAST, getRequestedParams(), isDhcpRapidCommitEnabled(), mHostname);
+                DO_UNICAST, getRequestedParams(), isDhcpRapidCommitEnabled(), mHostname,
+                mConfiguration.options);
         mMetrics.incrementCountForDiscover();
         return transmitPacket(packet, "DHCPDISCOVER", DhcpPacket.ENCAP_L2, INADDR_BROADCAST);
     }
@@ -757,9 +763,9 @@ public class DhcpClient extends StateMachine {
                 ? DhcpPacket.ENCAP_L2 : DhcpPacket.ENCAP_BOOTP;
 
         final ByteBuffer packet = DhcpPacket.buildRequestPacket(
-                encap, mTransactionId, getSecs(), clientAddress,
-                DO_UNICAST, mHwAddr, requestedAddress,
-                serverAddress, getRequestedParams(), mHostname);
+                encap, mTransactionId, getSecs(), clientAddress, DO_UNICAST, mHwAddr,
+                requestedAddress, serverAddress, getRequestedParams(), mHostname,
+                mConfiguration.options);
         String serverStr = (serverAddress != null) ? serverAddress.getHostAddress() : null;
         String description = "DHCPREQUEST ciaddr=" + clientAddress.getHostAddress() +
                              " request=" + requestedAddress.getHostAddress() +
@@ -980,10 +986,14 @@ public class DhcpClient extends StateMachine {
         @Nullable
         public final String l2Key;
         public final boolean isPreconnectionEnabled;
+        @NonNull
+        public final List<DhcpOption> options;
 
-        public Configuration(@Nullable final String l2Key, final boolean isPreconnectionEnabled) {
+        public Configuration(@Nullable final String l2Key, final boolean isPreconnectionEnabled,
+                @NonNull final List<DhcpOption> options) {
             this.l2Key = l2Key;
             this.isPreconnectionEnabled = isPreconnectionEnabled;
+            this.options = options;
         }
     }
 
@@ -1380,7 +1390,8 @@ public class DhcpClient extends StateMachine {
             final Layer2PacketParcelable l2Packet = new Layer2PacketParcelable();
             final ByteBuffer packet = DhcpPacket.buildDiscoverPacket(
                     DhcpPacket.ENCAP_L2, mTransactionId, getSecs(), mHwAddr,
-                    DO_UNICAST, getRequestedParams(), true /* rapid commit */, mHostname);
+                    DO_UNICAST, getRequestedParams(), true /* rapid commit */, mHostname,
+                    mConfiguration.options);
 
             l2Packet.dstMacAddress = MacAddress.fromBytes(DhcpPacket.ETHER_BROADCAST);
             l2Packet.payload = Arrays.copyOf(packet.array(), packet.limit());

@@ -35,23 +35,23 @@ import static android.system.OsConstants.IPPROTO_TCP;
 
 import static com.android.net.module.util.Inet4AddressUtils.getBroadcastAddress;
 import static com.android.net.module.util.Inet4AddressUtils.getPrefixMaskAsInet4Address;
-import static com.android.server.util.NetworkStackConstants.ARP_REPLY;
-import static com.android.server.util.NetworkStackConstants.ARP_REQUEST;
-import static com.android.server.util.NetworkStackConstants.ETHER_ADDR_LEN;
-import static com.android.server.util.NetworkStackConstants.ETHER_HEADER_LEN;
-import static com.android.server.util.NetworkStackConstants.ETHER_TYPE_IPV6;
-import static com.android.server.util.NetworkStackConstants.ETHER_TYPE_OFFSET;
-import static com.android.server.util.NetworkStackConstants.ICMPV6_CHECKSUM_OFFSET;
-import static com.android.server.util.NetworkStackConstants.ICMPV6_ND_OPTION_LENGTH_SCALING_FACTOR;
-import static com.android.server.util.NetworkStackConstants.ICMPV6_ND_OPTION_PIO;
-import static com.android.server.util.NetworkStackConstants.ICMPV6_ND_OPTION_RDNSS;
-import static com.android.server.util.NetworkStackConstants.ICMPV6_RA_HEADER_LEN;
-import static com.android.server.util.NetworkStackConstants.ICMPV6_ROUTER_ADVERTISEMENT;
-import static com.android.server.util.NetworkStackConstants.ICMPV6_ROUTER_SOLICITATION;
-import static com.android.server.util.NetworkStackConstants.IPV4_ADDR_ANY;
-import static com.android.server.util.NetworkStackConstants.IPV6_HEADER_LEN;
-import static com.android.server.util.NetworkStackConstants.IPV6_LEN_OFFSET;
-import static com.android.server.util.NetworkStackConstants.IPV6_PROTOCOL_OFFSET;
+import static com.android.net.module.util.NetworkStackConstants.ARP_REPLY;
+import static com.android.net.module.util.NetworkStackConstants.ARP_REQUEST;
+import static com.android.net.module.util.NetworkStackConstants.ETHER_ADDR_LEN;
+import static com.android.net.module.util.NetworkStackConstants.ETHER_HEADER_LEN;
+import static com.android.net.module.util.NetworkStackConstants.ETHER_TYPE_IPV6;
+import static com.android.net.module.util.NetworkStackConstants.ETHER_TYPE_OFFSET;
+import static com.android.net.module.util.NetworkStackConstants.ICMPV6_CHECKSUM_OFFSET;
+import static com.android.net.module.util.NetworkStackConstants.ICMPV6_ND_OPTION_LENGTH_SCALING_FACTOR;
+import static com.android.net.module.util.NetworkStackConstants.ICMPV6_ND_OPTION_PIO;
+import static com.android.net.module.util.NetworkStackConstants.ICMPV6_ND_OPTION_RDNSS;
+import static com.android.net.module.util.NetworkStackConstants.ICMPV6_RA_HEADER_LEN;
+import static com.android.net.module.util.NetworkStackConstants.ICMPV6_ROUTER_ADVERTISEMENT;
+import static com.android.net.module.util.NetworkStackConstants.ICMPV6_ROUTER_SOLICITATION;
+import static com.android.net.module.util.NetworkStackConstants.IPV4_ADDR_ANY;
+import static com.android.net.module.util.NetworkStackConstants.IPV6_HEADER_LEN;
+import static com.android.net.module.util.NetworkStackConstants.IPV6_LEN_OFFSET;
+import static com.android.net.module.util.NetworkStackConstants.IPV6_PROTOCOL_OFFSET;
 
 import static junit.framework.Assert.fail;
 
@@ -116,11 +116,11 @@ import android.net.ipmemorystore.OnNetworkAttributesRetrievedListener;
 import android.net.ipmemorystore.Status;
 import android.net.netlink.StructNdOptPref64;
 import android.net.networkstack.TestNetworkStackServiceClient;
+import android.net.networkstack.aidl.dhcp.DhcpOption;
 import android.net.shared.Layer2Information;
 import android.net.shared.ProvisioningConfiguration;
 import android.net.shared.ProvisioningConfiguration.ScanResultInfo;
 import android.net.util.InterfaceParams;
-import android.net.util.IpUtils;
 import android.net.util.NetworkStackUtils;
 import android.os.Build;
 import android.os.Handler;
@@ -141,6 +141,7 @@ import androidx.test.runner.AndroidJUnit4;
 
 import com.android.internal.util.StateMachine;
 import com.android.net.module.util.ArrayTrackRecord;
+import com.android.net.module.util.IpUtils;
 import com.android.networkstack.apishim.CaptivePortalDataShimImpl;
 import com.android.networkstack.apishim.ConstantsShim;
 import com.android.networkstack.apishim.common.ShimUtils;
@@ -169,6 +170,7 @@ import org.mockito.MockitoAnnotations;
 import org.mockito.Spy;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileReader;
 import java.io.IOException;
@@ -336,6 +338,14 @@ public abstract class IpClientIntegrationTestCommon {
     private static final String TEST_DHCP_ROAM_L2KEY = "roaming_l2key";
     private static final String TEST_DHCP_ROAM_CLUSTER = "roaming_cluster";
     private static final byte[] TEST_AP_OUI = new byte[] { 0x00, 0x1A, 0x11 };
+    private static final byte[] TEST_OEM_OUI = new byte[] {(byte) 0x00, (byte) 0x17, (byte) 0xc3};
+    private static final String TEST_OEM_VENDOR_ID = "vendor-class-identifier";
+    private static final byte[] TEST_OEM_USER_CLASS_INFO = new byte[] {
+            // Instance of User Class: [0]
+            (byte) 0x03, /* UC_Len_0 */ (byte) 0x11, (byte) 0x22, (byte) 0x33,
+            // Instance of User Class: [1]
+            (byte) 0x03, /* UC_Len_1 */ (byte) 0x44, (byte) 0x55, (byte) 0x66,
+    };
 
     protected class Dependencies extends IpClient.Dependencies {
         private boolean mIsDhcpLeaseCacheEnabled;
@@ -2189,6 +2199,12 @@ public abstract class IpClientIntegrationTestCommon {
         return new ScanResultInfo(ssid, bssid, Collections.singletonList(ie));
     }
 
+    private ScanResultInfo makeScanResultInfo(final int id, final byte[] oui, final byte type) {
+        byte[] data = new byte[10];
+        new Random().nextBytes(data);
+        return makeScanResultInfo(id, TEST_DEFAULT_SSID, TEST_DEFAULT_BSSID, oui, type, data);
+    }
+
     private ScanResultInfo makeScanResultInfo(final String ssid, final String bssid) {
         byte[] data = new byte[10];
         new Random().nextBytes(data);
@@ -2653,5 +2669,173 @@ public abstract class IpClientIntegrationTestCommon {
         // Client processes DHCPACK packet normally and transits to the ConfiguringInterfaceState
         // due to the null V6ONLY_WAIT.
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
+    }
+
+    private static int getNumOpenFds() {
+        return new File("/proc/" + Os.getpid() + "/fd").listFiles().length;
+    }
+
+    private void shutdownAndRecreateIpClient() throws Exception {
+        mIpc.shutdown();
+        awaitIpClientShutdown();
+        mIpc = makeIpClient();
+    }
+
+    @Test @SignatureRequiredTest(reason = "Only counts FDs from the current process. TODO: fix")
+    public void testNoFdLeaks() throws Exception {
+        // Shut down and restart IpClient once to ensure that any fds that are opened the first
+        // time it runs do not cause the test to fail.
+        doDualStackProvisioning();
+        shutdownAndRecreateIpClient();
+
+        // Unfortunately we cannot use a large number of iterations as it would make the test run
+        // too slowly. On crosshatch-eng each iteration takes ~250ms.
+        final int iterations = 10;
+        final int before = getNumOpenFds();
+        for (int i = 0; i < iterations; i++) {
+            doDualStackProvisioning();
+            shutdownAndRecreateIpClient();
+            // The last time this loop runs, mIpc will be shut down in tearDown.
+        }
+        final int after = getNumOpenFds();
+
+        // Check that the number of open fds is the same as before.
+        // If this exact match becomes flaky, we could add some tolerance here (e.g., allow 2-3
+        // extra fds), since it's likely that any leak would at least leak one FD per loop.
+        assertEquals("Fd leak after " + iterations + " iterations: ", before, after);
+    }
+
+    // TODO: delete when DhcpOption is @JavaOnlyImmutable.
+    private static DhcpOption makeDhcpOption(final byte type, final byte[] value) {
+        final DhcpOption opt = new DhcpOption();
+        opt.type = type;
+        opt.value = value;
+        return opt;
+    }
+
+    private static final List<DhcpOption> TEST_OEM_DHCP_OPTIONS = Arrays.asList(
+            // DHCP_USER_CLASS
+            makeDhcpOption((byte) 77, TEST_OEM_USER_CLASS_INFO),
+            // DHCP_VENDOR_CLASS_ID
+            makeDhcpOption((byte) 60, TEST_OEM_VENDOR_ID.getBytes())
+    );
+
+    private DhcpPacket doCustomizedDhcpOptionsTest(final List<DhcpOption> options,
+             final ScanResultInfo info) throws Exception {
+        ProvisioningConfiguration.Builder prov = new ProvisioningConfiguration.Builder()
+                .withoutIpReachabilityMonitor()
+                .withLayer2Information(new Layer2Information(TEST_L2KEY, TEST_CLUSTER,
+                        MacAddress.fromString(TEST_DEFAULT_BSSID)))
+                .withScanResultInfo(info)
+                .withDhcpOptions(options)
+                .withoutIPv6();
+
+        setDhcpFeatures(false /* isDhcpLeaseCacheEnabled */, false /* isRapidCommitEnabled */,
+                false /* isDhcpIpConflictDetectEnabled */);
+
+        startIpClientProvisioning(prov.build());
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).setFallbackMulticastFilter(false);
+        verify(mCb, never()).onProvisioningFailure(any());
+
+        return getNextDhcpPacket();
+    }
+
+    @Test
+    public void testCustomizedDhcpOptions() throws Exception {
+        final ScanResultInfo info = makeScanResultInfo(0xdd /* vendor-specificIE */, TEST_OEM_OUI,
+                (byte) 0x17 /* vendor-specific IE type */);
+        final DhcpPacket packet = doCustomizedDhcpOptionsTest(TEST_OEM_DHCP_OPTIONS, info);
+
+        assertTrue(packet instanceof DhcpDiscoverPacket);
+        assertEquals(packet.mVendorId, TEST_OEM_VENDOR_ID);
+        assertArrayEquals(packet.mUserClass, TEST_OEM_USER_CLASS_INFO);
+    }
+
+    @Test
+    public void testCustomizedDhcpOptions_nullDhcpOptions() throws Exception {
+        final ScanResultInfo info = makeScanResultInfo(0xdd /* vendor-specificIE */, TEST_OEM_OUI,
+                (byte) 0x17 /* vendor-specific IE type */);
+        final DhcpPacket packet = doCustomizedDhcpOptionsTest(null /* options */, info);
+
+        assertTrue(packet instanceof DhcpDiscoverPacket);
+        assertEquals(packet.mVendorId, new String("android-dhcp-" + Build.VERSION.RELEASE));
+        assertNull(packet.mUserClass);
+    }
+
+    @Test
+    public void testCustomizedDhcpOptions_nullScanResultInfo() throws Exception {
+        final DhcpPacket packet = doCustomizedDhcpOptionsTest(TEST_OEM_DHCP_OPTIONS,
+                null /* scanResultInfo */);
+
+        assertTrue(packet instanceof DhcpDiscoverPacket);
+        assertEquals(packet.mVendorId, new String("android-dhcp-" + Build.VERSION.RELEASE));
+        assertNull(packet.mUserClass);
+    }
+
+    @Test
+    public void testCustomizedDhcpOptions_disallowedOui() throws Exception {
+        final ScanResultInfo info = makeScanResultInfo(0xdd /* vendor-specificIE */,
+                new byte[]{ 0x00, 0x11, 0x22} /* oui */, (byte) 0x17 /* vendor-specific IE type */);
+        final DhcpPacket packet = doCustomizedDhcpOptionsTest(TEST_OEM_DHCP_OPTIONS, info);
+
+        assertTrue(packet instanceof DhcpDiscoverPacket);
+        assertEquals(packet.mVendorId, new String("android-dhcp-" + Build.VERSION.RELEASE));
+        assertNull(packet.mUserClass);
+    }
+
+    @Test
+    public void testCustomizedDhcpOptions_invalidIeId() throws Exception {
+        final ScanResultInfo info = makeScanResultInfo(0xde /* vendor-specificIE */, TEST_OEM_OUI,
+                (byte) 0x17 /* vendor-specific IE type */);
+        final DhcpPacket packet = doCustomizedDhcpOptionsTest(TEST_OEM_DHCP_OPTIONS, info);
+
+        assertTrue(packet instanceof DhcpDiscoverPacket);
+        assertEquals(packet.mVendorId, new String("android-dhcp-" + Build.VERSION.RELEASE));
+        assertNull(packet.mUserClass);
+    }
+
+    @Test
+    public void testCustomizedDhcpOptions_invalidVendorSpecificType() throws Exception {
+        final ScanResultInfo info = makeScanResultInfo(0xdd /* vendor-specificIE */, TEST_OEM_OUI,
+                (byte) 0x10 /* vendor-specific IE type */);
+        final DhcpPacket packet = doCustomizedDhcpOptionsTest(TEST_OEM_DHCP_OPTIONS, info);
+
+        assertTrue(packet instanceof DhcpDiscoverPacket);
+        assertEquals(packet.mVendorId, new String("android-dhcp-" + Build.VERSION.RELEASE));
+        assertNull(packet.mUserClass);
+    }
+
+    @Test
+    public void testCustomizedDhcpOptions_disallowedOption() throws Exception {
+        final List<DhcpOption> options = Arrays.asList(
+                makeDhcpOption((byte) 60, TEST_OEM_VENDOR_ID.getBytes()),
+                makeDhcpOption((byte) 77, TEST_OEM_USER_CLASS_INFO),
+                // DHCP_HOST_NAME
+                makeDhcpOption((byte) 12, new String("Pixel 3 XL").getBytes()));
+        final ScanResultInfo info = makeScanResultInfo(0xdd /* vendor-specificIE */, TEST_OEM_OUI,
+                (byte) 0x17 /* vendor-specific IE type */);
+        final DhcpPacket packet = doCustomizedDhcpOptionsTest(options, info);
+
+        assertTrue(packet instanceof DhcpDiscoverPacket);
+        assertEquals(packet.mVendorId, TEST_OEM_VENDOR_ID);
+        assertArrayEquals(packet.mUserClass, TEST_OEM_USER_CLASS_INFO);
+        assertNull(packet.mHostName);
+    }
+
+    @Test
+    public void testCustomizedDhcpOptions_disallowedParamRequestOption() throws Exception {
+        final List<DhcpOption> options = Arrays.asList(
+                makeDhcpOption((byte) 60, TEST_OEM_VENDOR_ID.getBytes()),
+                makeDhcpOption((byte) 77, TEST_OEM_USER_CLASS_INFO),
+                // NTP_SERVER
+                makeDhcpOption((byte) 42, null));
+        final ScanResultInfo info = makeScanResultInfo(0xdd /* vendor-specificIE */, TEST_OEM_OUI,
+                (byte) 0x17 /* vendor-specific IE type */);
+        final DhcpPacket packet = doCustomizedDhcpOptionsTest(options, info);
+
+        assertTrue(packet instanceof DhcpDiscoverPacket);
+        assertEquals(packet.mVendorId, TEST_OEM_VENDOR_ID);
+        assertArrayEquals(packet.mUserClass, TEST_OEM_USER_CLASS_INFO);
+        assertFalse(packet.hasRequestedParam((byte) 42 /* NTP_SERVER */));
     }
 }
