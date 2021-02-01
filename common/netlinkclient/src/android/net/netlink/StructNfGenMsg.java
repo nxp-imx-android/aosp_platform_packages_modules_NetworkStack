@@ -79,11 +79,25 @@ public class StructNfGenMsg {
     public void pack(ByteBuffer byteBuffer) {
         byteBuffer.put(nfgen_family);
         byteBuffer.put(version);
-        // TODO: probably need to handle the little endian case.
+
+        final ByteOrder originalOrder = byteBuffer.order();
+        byteBuffer.order(ByteOrder.BIG_ENDIAN);
         byteBuffer.putShort(res_id);
+        byteBuffer.order(originalOrder);
     }
 
     private static boolean hasAvailableSpace(@NonNull ByteBuffer byteBuffer) {
         return byteBuffer.remaining() >= STRUCT_SIZE;
+    }
+
+    @Override
+    public String toString() {
+        final String familyStr = NetlinkConstants.stringForAddressFamily(nfgen_family);
+
+        return "NfGenMsg{ "
+                + "nfgen_family{" + familyStr + "}, "
+                + "version{" + Byte.toUnsignedInt(version) + "}, "
+                + "res_id{" + Short.toUnsignedInt(res_id) + "} "
+                + "}";
     }
 }
