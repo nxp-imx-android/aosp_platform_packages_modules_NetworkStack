@@ -41,6 +41,10 @@
 //                                                         TestNetworkStack
 
 // Common defaults to define SDK level
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 java_defaults {
     name: "NetworkStackDevApiLevel",
     min_sdk_version: "29",
@@ -88,7 +92,7 @@ java_defaults {
     libs: ["unsupportedappusage"],
     static_libs: [
         "androidx.annotation_annotation",
-        "netd_aidl_interface-unstable-java",
+        "netd_aidl_interface-lateststable-java",
         "netlink-client",
         "networkstack-client",
         "net-utils-framework-common",
