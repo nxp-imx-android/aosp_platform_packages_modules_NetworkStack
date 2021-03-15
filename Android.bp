@@ -45,6 +45,10 @@ package {
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
+// Whether to enable the targets in this file that target current SDKs.
+// Set to false in branches like mainline-prod where API classes are too old to build current code.
+enable_current_sdk_targets = true
+
 java_defaults {
     name: "NetworkStackDevApiLevel",
     min_sdk_version: "29",
@@ -64,6 +68,10 @@ java_defaults {
     libs: [
         "androidx.annotation_annotation",
         "networkstack-client",
+    ],
+    apex_available: [
+        "com.android.tethering",
+        "//apex_available:platform",  // For InProcessNetworkStack and InProcessTethering
     ],
     min_sdk_version: "29",
 }
@@ -113,6 +121,7 @@ java_library {
 // integer so if the next SDK release happens to use that integer, we don't need to rename them.
 java_library {
     name: "NetworkStackApi31Shims",
+    enabled: enable_current_sdk_targets,
     defaults: ["NetworkStackShimsDefaults"],
     srcs: [
         "apishim/31/**/*.java",
@@ -121,8 +130,9 @@ java_library {
         "NetworkStackShimsCommon",
         "NetworkStackApi29Shims",
         "NetworkStackApi30Shims",
+        "framework-connectivity",
     ],
-    sdk_version: "system_current",
+    sdk_version: "module_current",
     visibility: ["//visibility:private"],
 }
 
@@ -131,6 +141,7 @@ java_library {
 // called directly by the networkstack code.
 java_library {
     name: "NetworkStackApiCurrentShims",
+    enabled: enable_current_sdk_targets,
     defaults: ["NetworkStackShimsDefaults"],
     static_libs: [
         "NetworkStackShimsCommon",
@@ -138,8 +149,11 @@ java_library {
         "NetworkStackApi30Shims",
         "NetworkStackApi31Shims",
     ],
-    sdk_version: "system_current",
-    visibility: ["//visibility:private"],
+    sdk_version: "module_current",
+    visibility: [
+        "//packages/modules/Connectivity/Tethering",
+        "//packages/modules/Connectivity/tests/cts/net",
+    ],
 }
 
 // API stable uses jarjar to rename the latest stable apishim package from
@@ -155,7 +169,10 @@ java_library {
     ],
     jarjar_rules: "apishim/jarjar-rules-compat.txt",
     sdk_version: "system_30",
-    visibility: ["//visibility:private"],
+    visibility: [
+        "//packages/modules/Connectivity/Tethering",
+        "//packages/modules/Connectivity/tests/cts/net",
+    ],
 }
 
 // Common defaults for android libraries containing network stack code, used to compile variants of
@@ -192,6 +209,14 @@ android_library {
     ],
     static_libs: ["NetworkStackApiCurrentShims"],
     manifest: "AndroidManifestBase.xml",
+    enabled: enable_current_sdk_targets,
+    visibility: [
+        "//frameworks/base/tests/net/integration",
+        "//packages/modules/Connectivity/Tethering/tests/integration",
+        "//packages/modules/Connectivity/tests/cts/net",
+        "//packages/modules/NetworkStack/tests/unit",
+        "//packages/modules/NetworkStack/tests/integration",
+    ],
 }
 
 android_library {
@@ -203,6 +228,13 @@ android_library {
     ],
     static_libs: ["NetworkStackApiStableShims"],
     manifest: "AndroidManifestBase.xml",
+    visibility: [
+        "//frameworks/base/tests/net/integration",
+        "//packages/modules/Connectivity/Tethering/tests/integration",
+        "//packages/modules/Connectivity/tests/cts/net",
+        "//packages/modules/NetworkStack/tests/unit",
+        "//packages/modules/NetworkStack/tests/integration",
+    ],
 }
 
 filegroup {
@@ -211,7 +243,6 @@ filegroup {
     visibility: [
         "//packages/modules/NetworkStack/tests/unit",
         "//packages/modules/NetworkStack/tests/integration",
-        "//frameworks/base/packages/Tethering/tests/integration",
         "//packages/modules/Connectivity/Tethering/tests/integration",
     ]
 }
@@ -246,6 +277,7 @@ android_app {
     // The InProcessNetworkStack goes together with the PlatformCaptivePortalLogin, which replaces
     // the default CaptivePortalLogin.
     required: ["PlatformNetworkPermissionConfig", "PlatformCaptivePortalLogin"],
+    enabled: enable_current_sdk_targets,
 }
 
 // Pre-merge the AndroidManifest for NetworkStackNext, so that its manifest can be merged on top
@@ -253,7 +285,8 @@ android_library {
     name: "NetworkStackNextManifestBase",
     defaults: ["NetworkStackAppDefaults", "NetworkStackDevApiLevel"],
     static_libs: ["NetworkStackApiCurrentLib"],
-    manifest: "AndroidManifest.xml"
+    manifest: "AndroidManifest.xml",
+    enabled: enable_current_sdk_targets,
 }
 
 // NetworkStack build targeting the current API release, for testing on in-development SDK
@@ -265,6 +298,7 @@ android_app {
     manifest: "AndroidManifest_Next.xml",
     // The permission configuration *must* be included to ensure security of the device
     required: ["NetworkPermissionConfig"],
+    enabled: enable_current_sdk_targets,
 }
 
 // Updatable network stack for finalized API
@@ -277,19 +311,6 @@ android_app {
     // The permission configuration *must* be included to ensure security of the device
     required: ["NetworkPermissionConfig"],
     updatable: true,
-}
-
-// Android library to derive test APKs for integration tests
-android_library {
-    name: "TestNetworkStackLib",
-    defaults: ["NetworkStackAppDefaults", "NetworkStackReleaseApiLevel"],
-    static_libs: ["NetworkStackApiStableLib"],
-    manifest: "AndroidManifestBase.xml",
-    visibility: [
-        "//frameworks/base/tests/net/integration",
-        "//cts/tests/tests/net",
-        "//packages/modules/Connectivity/tests/cts/net",
-    ],
 }
 
 cc_library_shared {
