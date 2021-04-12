@@ -24,7 +24,6 @@ import android.os.Build;
 import android.os.Handler;
 
 import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 
 import com.android.networkstack.apishim.common.ConnectivityManagerShim;
 import com.android.networkstack.apishim.common.ShimUtils;
@@ -57,7 +56,7 @@ public class ConnectivityManagerShimImpl
      */
     @Override
     public void requestBackgroundNetwork(@NonNull NetworkRequest request,
-            @Nullable Handler handler, @NonNull NetworkCallback networkCallback) {
+            @NonNull Handler handler, @NonNull NetworkCallback networkCallback) {
         mCm.requestBackgroundNetwork(request, handler, networkCallback);
     }
 
@@ -68,5 +67,14 @@ public class ConnectivityManagerShimImpl
     public void registerSystemDefaultNetworkCallback(
             @NonNull NetworkCallback networkCallback, @NonNull Handler handler) {
         mCm.registerSystemDefaultNetworkCallback(networkCallback, handler);
+    }
+
+    /**
+     * See android.net.ConnectivityManager#registerDefaultNetworkCallbackAsUid
+     */
+    @Override
+    public void registerDefaultNetworkCallbackAsUid(
+            int uid, @NonNull NetworkCallback networkCallback, @NonNull Handler handler) {
+        mCm.registerDefaultNetworkCallbackAsUid(uid, networkCallback, handler);
     }
 }
