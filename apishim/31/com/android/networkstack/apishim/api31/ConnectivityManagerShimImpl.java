@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package com.android.networkstack.apishim;
+package com.android.networkstack.apishim.api31;
 
 import static com.android.modules.utils.build.SdkLevel.isAtLeastS;
 
@@ -39,6 +39,7 @@ import java.util.Collection;
 public class ConnectivityManagerShimImpl
         extends com.android.networkstack.apishim.api30.ConnectivityManagerShimImpl  {
 
+    @RequiresApi(Build.VERSION_CODES.S)
     protected ConnectivityManagerShimImpl(Context context) {
         super(context);
     }

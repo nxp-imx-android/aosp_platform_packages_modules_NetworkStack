@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package com.android.networkstack.apishim;
+package com.android.networkstack.apishim.api31;
 
 import static com.android.modules.utils.build.SdkLevel.isAtLeastS;
 
@@ -36,6 +36,7 @@ import java.util.Set;
 @RequiresApi(Build.VERSION_CODES.S)
 public class NetworkRequestShimImpl
         extends com.android.networkstack.apishim.api30.NetworkRequestShimImpl {
+    @RequiresApi(Build.VERSION_CODES.S)
     protected NetworkRequestShimImpl() {
         super();
     }
